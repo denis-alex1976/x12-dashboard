@@ -652,12 +652,16 @@ def main():
     # ===== ТОП-3 =====
     st.subheader("🏆 ТОП-3 менеджера")
 
-    sales_period = sales_data[sales_data['order_type'] == 0]
+    # Для ТОП-3 всегда берём ВСЕХ менеджеров (независимо от фильтра)
+    all_sales = data_loader.filter_sales(df, selected_periods, 'Все менеджеры')
+    all_payments = data_loader.filter_payments(df, selected_periods, 'Все менеджеры')
+
+    sales_period = all_sales[all_sales['order_type'] == 0]
     by_mgr_sales = sales_period.groupby('manager')['invoice_amount'].sum().reset_index()
     by_mgr_sales.columns = ['manager', 'amount']
     top3_sales = by_mgr_sales.sort_values('amount', ascending=False).head(3)
 
-    by_mgr_payments = payments_data.groupby('manager')['payment_amount'].sum().reset_index()
+    by_mgr_payments = all_payments.groupby('manager')['payment_amount'].sum().reset_index()
     by_mgr_payments.columns = ['manager', 'amount']
     top3_payments = by_mgr_payments.sort_values('amount', ascending=False).head(3)
 
@@ -1192,14 +1196,18 @@ def main():
                 display.columns = ['Менеджер', 'Оплаты, BYN', 'Доля, %', 'Бонус, BYN', 'Кол-во оплат']
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
+                # Pie по долям
+                pie_data = by_mgr_pay[by_mgr_pay['payments'] > 0].copy()
+                pie_data['payments_str'] = pie_data['payments'].apply(format_int)
+
                 fig = px.pie(
-                    by_mgr_pay[by_mgr_pay['payments'] > 0],
+                    pie_data,
                     values='payments', names='manager',
                     color='manager',
                     color_discrete_sequence=CONTRAST_PALETTE
                 )
                 fig.update_traces(
-                    hovertemplate='<b>%{label}</b><br>%{percent}<extra></extra>'
+                    hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>'
                 )
                 st.plotly_chart(fig, use_container_width=True)
             else:

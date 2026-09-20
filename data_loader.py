@@ -4,7 +4,15 @@ import os
 from datetime import datetime, timedelta
 import hashlib
 
-from comments_parser import load_comments
+try:
+    from comments_parser import load_comments, parse_comment
+    _COMMENTS_AVAILABLE = True
+except Exception:
+    _COMMENTS_AVAILABLE = False
+    def load_comments():
+        return {}
+    def parse_comment(text):
+        return []
 
 EXCEL_PATH = r"C:\ЦЕНТР ИЗЖ\Х\!-Х12.1.xlsm"
 SHEET_NAME = "ИСХОДНЫЕ ДАННЫЕ"
@@ -23,9 +31,6 @@ MANAGERS_LIST = [
     'Федук П.',
 ]
 
-# Белый список активных менеджеров для фильтра.
-# Остальные из database.json скрываются из селектора,
-# но продолжают фигурировать в данных.
 ACTIVE_MANAGERS = [
     'Все менеджеры',
     'Бабура С.',
@@ -36,15 +41,31 @@ ACTIVE_MANAGERS = [
     'Федук П.',
 ]
 
+# Все менеджеры, которые могут встречаться в реальных данных.
+# Используется для отсеивания служебных блоков в Excel/Google Sheets.
+ALL_MANAGERS = [
+    'Бабура С.',
+    'Крупенькина Е.',
+    'Чубарь Д.',
+    'Буян В.',
+    'Пудакевич И.',
+    'Федук П.',
+    'Вашкевич А.',
+    'Шиянов В.',
+    'Пломодьялов Д.',
+    'Сагайдак В.',
+    'Зварич Д.',
+    'Нестер А.',
+    'Ребковец Е.',
+    'Бабайцев Е.',
+]
+
 DEFAULT_BONUS_SETTINGS = {
     'use_by_category': False,
     'use_by_threshold': True,
     'rates_by_category': {
-        '0-30': 0.0,
-        '31-60': 0.0,
-        '61-90': 0.0,
-        '91-120': 0.0,
-        '120+': 0.0,
+        '0-30': 0.0, '31-60': 0.0, '61-90': 0.0,
+        '91-120': 0.0, '120+': 0.0,
     },
     'thresholds': [
         {'min_amount': 20000.0, 'rate': 1.0},
@@ -52,6 +73,21 @@ DEFAULT_BONUS_SETTINGS = {
         {'min_amount': 50000.0, 'rate': 3.0},
     ],
 }
+
+# === GOOGLE SHEETS ===
+GSHEETS_CREDENTIALS = "service-account.json"
+GSHEETS_SPREADSHEET_ID = "1AWSwJECekzgfvbYlBsBk-Ws78hpNp5TC7VSPdvv0Nso"
+GSHEETS_WORKSHEET = "Data"
+GSHEETS_USERS_WORKSHEET = "Users"
+
+GSHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+USER_COLUMNS = ['username', 'password_hash', 'name', 'role',
+                'manager_binding', 'blocked', 'allowed_tabs']
+
 
 # === ТРАНСЛИТЕРАЦИЯ И ПАРОЛИ ===
 
@@ -68,7 +104,6 @@ TRANSLIT_MAP = {
     'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya',
 }
 
-# Ручной маппинг для менеджеров (по фамилии → латиница)
 MANAGER_LOGIN_MAP = {
     'Бабура С.': 'babura',
     'Крупенькина Е.': 'krupenkina',
@@ -80,31 +115,144 @@ MANAGER_LOGIN_MAP = {
 
 
 def transliterate(text):
-    """Транслитерация русского текста в латиницу"""
     if not text:
         return ''
-    result = []
-    for ch in text:
-        result.append(TRANSLIT_MAP.get(ch, ch))
-    return ''.join(result)
+    return ''.join(TRANSLIT_MAP.get(ch, ch) for ch in text)
 
 
 def generate_login_from_manager(manager_name):
-    """Логин из имени менеджера. Сначала пробуем ручной маппинг."""
     if manager_name in MANAGER_LOGIN_MAP:
         return MANAGER_LOGIN_MAP[manager_name]
-    # Иначе — транслитерация фамилии (первое слово)
     first_word = manager_name.split()[0] if manager_name else ''
     return transliterate(first_word).lower()
 
 
 def generate_password(length=8):
-    """Случайный пароль"""
     import random
     import string
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
+
+# === GOOGLE SHEETS ===
+
+def _get_gsheets_creds():
+    from google.oauth2.service_account import Credentials
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            return Credentials.from_service_account_info(creds_dict, scopes=GSHEETS_SCOPES)
+    except Exception:
+        pass
+    return Credentials.from_service_account_file(GSHEETS_CREDENTIALS, scopes=GSHEETS_SCOPES)
+
+
+def _get_gsheets_client():
+    import gspread
+    return gspread.authorize(_get_gsheets_creds())
+
+
+def load_from_gsheets():
+    try:
+        gc = _get_gsheets_client()
+        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
+        worksheet = sh.worksheet(GSHEETS_WORKSHEET)
+
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            print("⚠️ Google Sheets пустой")
+            return None
+
+        headers = data[0]
+        rows = data[1:]
+        df = pd.DataFrame(rows, columns=headers)
+        df = df.replace('', pd.NA)
+        print(f"✅ Загружено из Google Sheets: {len(df)} строк")
+        return df
+    except Exception as e:
+        print(f"❌ Ошибка чтения Google Sheets: {e}")
+        return None
+
+
+# === ПОЛЬЗОВАТЕЛИ ===
+
+def load_users_from_gsheets():
+    try:
+        gc = _get_gsheets_client()
+        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
+        worksheet = sh.worksheet(GSHEETS_USERS_WORKSHEET)
+
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return {}
+
+        headers = data[0]
+        users = {}
+        for row in data[1:]:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+
+            username = rec.get('username', '').strip()
+            if not username:
+                continue
+
+            blocked_raw = rec.get('blocked', '').strip().upper()
+            blocked = blocked_raw in ('TRUE', '1', 'YES', 'ДА')
+
+            tabs_raw = rec.get('allowed_tabs', '').strip()
+            if tabs_raw == 'all':
+                allowed_tabs = ['all']
+            elif tabs_raw:
+                allowed_tabs = [t.strip() for t in tabs_raw.split(',') if t.strip()]
+            else:
+                allowed_tabs = []
+
+            users[username] = {
+                'password': rec.get('password_hash', '').strip(),
+                'name': rec.get('name', '').strip(),
+                'role': rec.get('role', '').strip(),
+                'manager_binding': rec.get('manager_binding', '').strip() or None,
+                'blocked': blocked,
+                'allowed_tabs': allowed_tabs,
+                'last_login': None,
+            }
+        return users
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать лист Users: {e}")
+        return None
+
+
+def save_users_to_gsheets(users):
+    try:
+        gc = _get_gsheets_client()
+        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
+        worksheet = sh.worksheet(GSHEETS_USERS_WORKSHEET)
+
+        rows = [USER_COLUMNS]
+        for username, u in users.items():
+            tabs = u.get('allowed_tabs', [])
+            tabs_str = 'all' if 'all' in tabs else ','.join(tabs)
+
+            rows.append([
+                username,
+                u.get('password', ''),
+                u.get('name', ''),
+                u.get('role', ''),
+                u.get('manager_binding') or '',
+                'TRUE' if u.get('blocked') else 'FALSE',
+                tabs_str,
+            ])
+
+        worksheet.clear()
+        worksheet.update(rows, value_input_option='RAW')
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка записи листа Users: {e}")
+        return False
+
+
+# === ОБРАБОТКА ДАННЫХ ===
 
 def find_data_end(df):
     empty_streak = 0
@@ -123,17 +271,22 @@ def find_data_end(df):
 
 
 def load_excel_data():
-    try:
-        df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=0)
-        return process_data(df)
-    except Exception as e:
-        print(f"Ошибка загрузки Excel: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    df = load_from_gsheets()
+    from_gsheets = df is not None
+
+    if not from_gsheets:
+        print("⚠️ Google Sheets недоступен — пробую локальный Excel...")
+        try:
+            df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=0)
+            print(f"✅ Загружено из Excel: {len(df)} строк")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки Excel: {e}")
+            return None
+
+    return process_data(df, from_gsheets=from_gsheets)
 
 
-def process_data(df):
+def process_data(df, from_gsheets=False):
     column_mapping = {
         'Наименование хозяйства': 'company',
         'Область': 'oblast',
@@ -168,28 +321,59 @@ def process_data(df):
         print(f"⚠️ Отсутствуют критичные колонки: {missing_cols}")
         return None
 
+    # 1. Преобразование типов (важно для Google Sheets — там всё строки)
     df['invoice_date'] = pd.to_datetime(df['invoice_date'], errors='coerce')
     df['payment_date'] = pd.to_datetime(df['payment_date'], errors='coerce')
     df['invoice_amount'] = pd.to_numeric(df['invoice_amount'], errors='coerce').fillna(0)
     df['payment_amount'] = pd.to_numeric(df['payment_amount'], errors='coerce').fillna(0)
+    df['order_type'] = pd.to_numeric(df['order_type'], errors='coerce').fillna(-1).astype(int)
 
+    # 2. Отсеиваем строки со служебными блоками (нет валидного менеджера)
+    before = len(df)
+    df = df[df['manager'].isin(ALL_MANAGERS)].copy()
+    after = len(df)
+    if before != after:
+        print(f"⚠️ Отсеяно служебных строк: {before - after}")
+
+    # 3. Граница данных
     data_end = find_data_end(df)
-    print(f"✅ Граница данных: строка {data_end + 2} (Excel)")
+    print(f"✅ Граница данных: строка {data_end + 2}")
     df = df.iloc[:data_end + 1].copy()
 
-    comments = load_comments()
+    # 4. Примечания: из Google Sheets (payment_parts) или из локального Excel
+    comments_by_index = {}
+
+    if from_gsheets and 'payment_parts' in df.columns:
+        for idx, row in df.iterrows():
+            text = row.get('payment_parts', '')
+            if pd.notna(text) and str(text).strip():
+                parts = parse_comment(str(text))
+                if parts:
+                    comments_by_index[idx] = parts
+        print(f"✅ Примечаний из Google Sheets: {len(comments_by_index)}")
+    elif _COMMENTS_AVAILABLE:
+        try:
+            raw = load_comments()  # {номер_строки_Excel: [parts]}
+            comments_by_index = {int(k) - 2: v for k, v in raw.items()}
+            print(f"✅ Примечаний из Excel: {len(comments_by_index)}")
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать примечания: {e}")
+
+    # 5. Убираем служебную колонку payment_parts из рабочего DataFrame
+    if 'payment_parts' in df.columns:
+        df = df.drop(columns=['payment_parts'])
 
     sales_df = df.copy()
     sales_df['row_type'] = 'sale'
 
+    # 6. Разбивка оплат по примечаниям
     payment_rows = []
     for idx, row in df.iterrows():
-        excel_row = idx + 2
         total_payment = row['payment_amount']
         if total_payment == 0 and pd.isna(row['payment_num']):
             continue
 
-        parts = comments.get(excel_row, [])
+        parts = comments_by_index.get(idx, [])
 
         if not parts:
             new_row = row.to_dict()
@@ -229,13 +413,11 @@ def process_data(df):
     payments_only = combined[combined['row_type'] == 'payment']
     total_returns = float(payments_only['payment_amount'].sum())
 
-    db = load_database()
-
     print(f"✅ Строк 'sale': {len(sales_df)}, 'payment': {len(payments_df)}")
 
     return {
         'df': combined,
-        'database': db,
+        'database': load_database(),
         'summary': {
             'total_sales': total_sales,
             'total_prepayments': total_prepayments,
@@ -254,26 +436,20 @@ def get_period_options(df):
         5: 'май', 6: 'июнь', 7: 'июль', 8: 'август',
         9: 'сентябрь', 10: 'октябрь', 11: 'ноябрь', 12: 'декабрь'
     }
-
     options = ['Весь период']
     if df is None or df.empty:
         return options
-
     sales = df[(df['row_type'] == 'sale') & (df['order_type'] == 0)]
     if sales.empty:
         return options
-
     years = sorted(sales['invoice_date'].dt.year.dropna().unique().astype(int).tolist())
     years = [y for y in years if y >= 2025]
-
     for y in years:
         options.append(str(y))
-
     if 2026 in years:
         months = sales[sales['invoice_date'].dt.year == 2026]['invoice_date'].dt.month.dropna().unique()
         for m in sorted(months.astype(int).tolist()):
             options.append(f"2026 {months_ru[m]}")
-
     return options
 
 
@@ -346,8 +522,7 @@ def filter_payments(df, period_selection, manager):
 def get_total_sales(df_sales):
     if df_sales is None or df_sales.empty:
         return 0.0
-    sales = df_sales[df_sales['order_type'] == 0]
-    return float(sales['invoice_amount'].sum())
+    return float(df_sales[df_sales['order_type'] == 0]['invoice_amount'].sum())
 
 
 def get_total_payments(df_payments):
@@ -366,8 +541,7 @@ def get_total_prepayments(df_sales):
 def get_companies_count(df_sales):
     if df_sales is None or df_sales.empty:
         return 0
-    sales = df_sales[df_sales['order_type'] == 0]
-    return int(sales['company'].nunique())
+    return int(df_sales[df_sales['order_type'] == 0]['company'].nunique())
 
 
 def get_applications_count(df_sales):
@@ -626,19 +800,15 @@ def get_payment_category(invoice_date, payment_date):
 def get_payments_data(df, period_selection=None, manager=None):
     if df is None or df.empty:
         return pd.DataFrame()
-
     payments = filter_payments(df, period_selection, manager)
     payments = payments[payments['payment_amount'] > 0].copy()
-
     if payments.empty:
         return pd.DataFrame()
-
     payments['invoice_date_eff'] = payments['invoice_date'].fillna(payments['payment_date'])
     payments['category'] = payments.apply(
         lambda r: get_payment_category(r['invoice_date_eff'], r['payment_date']),
         axis=1
     )
-
     return payments
 
 
@@ -646,57 +816,19 @@ def get_payments_structure(df, period_selection=None, manager=None):
     payments = get_payments_data(df, period_selection, manager)
     if payments.empty:
         return pd.DataFrame(columns=['category', 'amount', 'count'])
-
     result = payments.groupby('category').agg({
         'payment_amount': 'sum',
         'company': 'count'
     }).reset_index()
     result.columns = ['category', 'amount', 'count']
-
     order = ['0-30', '31-60', '61-90', '91-120', '120+']
     result['category'] = pd.Categorical(result['category'], categories=order, ordered=True)
     return result.sort_values('category').reset_index(drop=True)
 
 
-def calc_bonus_for_payments(payments_df, bonus_settings):
-    """
-    Считает бонус для DataFrame оплат.
-    Возвращает DataFrame с колонками: payment_amount, bonus, bonus_category, bonus_threshold
-    """
-    if payments_df is None or payments_df.empty:
-        return payments_df
-
-    df = payments_df.copy()
-
-    use_cat = bonus_settings.get('use_by_category', False)
-    use_thr = bonus_settings.get('use_by_threshold', False)
-    rates_cat = bonus_settings.get('rates_by_category', {})
-    thresholds = bonus_settings.get('thresholds', [])
-
-    # Бонус по категориям
-    if use_cat:
-        df['bonus_category'] = df.apply(
-            lambda r: r['payment_amount'] * rates_cat.get(r.get('category', ''), 0.0) / 100.0,
-            axis=1
-        )
-    else:
-        df['bonus_category'] = 0.0
-
-    # Бонус по порогам — считается по общей сумме оплат менеджера за период
-    # Здесь возвращаем только флаг — расчёт на уровне менеджера в get_payments_by_manager
-    df['bonus_threshold'] = 0.0
-
-    return df
-
-
 def calc_threshold_bonus(total_amount, thresholds):
-    """
-    Считает бонус по порогу для общей суммы.
-    thresholds: [{'min_amount': X, 'rate': Y}, ...]
-    """
     if not thresholds or total_amount <= 0:
         return 0.0
-
     sorted_thr = sorted(thresholds, key=lambda x: x['min_amount'], reverse=True)
     for t in sorted_thr:
         if total_amount >= t['min_amount']:
@@ -707,7 +839,6 @@ def calc_threshold_bonus(total_amount, thresholds):
 def get_payments_by_manager(df, period_selection=None, bonus_settings=None):
     if df is None or df.empty:
         return pd.DataFrame()
-
     if bonus_settings is None:
         bonus_settings = DEFAULT_BONUS_SETTINGS
 
@@ -720,7 +851,6 @@ def get_payments_by_manager(df, period_selection=None, bonus_settings=None):
     rates_cat = bonus_settings.get('rates_by_category', {})
     thresholds = bonus_settings.get('thresholds', [])
 
-    # Бонус по категориям — для каждой оплаты
     if use_cat:
         payments['bonus_category'] = payments.apply(
             lambda r: r['payment_amount'] * rates_cat.get(r.get('category', ''), 0.0) / 100.0,
@@ -729,7 +859,6 @@ def get_payments_by_manager(df, period_selection=None, bonus_settings=None):
     else:
         payments['bonus_category'] = 0.0
 
-    # Группируем по менеджерам
     result = payments.groupby('manager').agg({
         'payment_amount': 'sum',
         'bonus_category': 'sum',
@@ -737,7 +866,6 @@ def get_payments_by_manager(df, period_selection=None, bonus_settings=None):
     }).reset_index()
     result.columns = ['manager', 'payments', 'bonus_category', 'count']
 
-    # Бонус по порогам — от общей суммы оплат менеджера
     if use_thr:
         result['bonus_threshold'] = result['payments'].apply(
             lambda total: calc_threshold_bonus(total, thresholds)
@@ -746,37 +874,26 @@ def get_payments_by_manager(df, period_selection=None, bonus_settings=None):
         result['bonus_threshold'] = 0.0
 
     result['bonus'] = result['bonus_category'] + result['bonus_threshold']
-
     total_payments = result['payments'].sum()
     result['share'] = result['payments'] / total_payments * 100 if total_payments > 0 else 0
-
     return result.sort_values('payments', ascending=False)
 
 
 def get_payments_by_manager_and_category(df, period_selection=None):
     if df is None or df.empty:
         return pd.DataFrame()
-
     payments = get_payments_data(df, period_selection, 'Все менеджеры')
     if payments.empty:
         return pd.DataFrame()
-
     result = payments.groupby(['manager', 'category'])['payment_amount'].sum().reset_index()
     result.columns = ['manager', 'category', 'amount']
-
     pivot = result.pivot_table(
-        index='manager',
-        columns='category',
-        values='amount',
-        aggfunc='sum',
-        fill_value=0
+        index='manager', columns='category', values='amount', aggfunc='sum', fill_value=0
     ).reset_index()
-
     order = ['0-30', '31-60', '61-90', '91-120', '120+']
     for cat in order:
         if cat not in pivot.columns:
             pivot[cat] = 0
-
     pivot = pivot[['manager'] + order]
     return pivot
 
@@ -785,7 +902,6 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
     payments = get_payments_data(df, period_selection, manager)
     if payments.empty:
         return pd.DataFrame()
-
     if bonus_settings is None:
         bonus_settings = DEFAULT_BONUS_SETTINGS
 
@@ -806,19 +922,12 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
     }).reset_index()
 
     pivot_amount = result.pivot_table(
-        index=['company', 'manager'],
-        columns='category',
-        values='payment_amount',
-        aggfunc='sum',
-        fill_value=0
+        index=['company', 'manager'], columns='category', values='payment_amount',
+        aggfunc='sum', fill_value=0
     ).reset_index()
-
     pivot_bonus = result.pivot_table(
-        index=['company', 'manager'],
-        columns='category',
-        values='bonus',
-        aggfunc='sum',
-        fill_value=0
+        index=['company', 'manager'], columns='category', values='bonus',
+        aggfunc='sum', fill_value=0
     ).reset_index()
 
     order = ['0-30', '31-60', '61-90', '91-120', '120+']
@@ -833,10 +942,8 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
 
     merged = pivot_amount[['company', 'manager', 'total_payments'] + order].merge(
         pivot_bonus[['company', 'manager', 'total_bonus']],
-        on=['company', 'manager'],
-        how='left'
+        on=['company', 'manager'], how='left'
     )
-
     return merged.sort_values('total_payments', ascending=False)
 
 
@@ -846,7 +953,6 @@ def get_bonus_settings():
     db = load_database()
     settings = db.get('bonus_settings')
     if not settings:
-        # Совместимость со старой структурой
         old_rates = db.get('bonus_rates', {})
         settings = dict(DEFAULT_BONUS_SETTINGS)
         settings['rates_by_category'] = {
@@ -866,12 +972,10 @@ def save_bonus_settings(settings):
 
 
 def get_bonus_rates():
-    """Совместимость"""
     return get_bonus_settings().get('rates_by_category', {})
 
 
 def save_bonus_rates(rates):
-    """Совместимость"""
     settings = get_bonus_settings()
     settings['rates_by_category'] = rates
     save_bonus_settings(settings)
@@ -884,11 +988,6 @@ def get_available_months(df):
 
 
 def get_available_managers(df=None):
-    """
-    Возвращает список менеджеров для фильтра — только те,
-    кто в белом списке ACTIVE_MANAGERS.
-    Остальные (архивные) скрываются из UI, но остаются в данных.
-    """
     return ACTIVE_MANAGERS
 
 
@@ -898,150 +997,23 @@ def filter_by_period(df, period_selection, manager):
 
 # === БАЗА ===
 
-# === АВТОРИЗАЦИЯ ===
-
-def authenticate(username, password):
-    """Проверка логина/пароля. Возвращает dict пользователя или None."""
-    db = load_database()
-    users = db.get('users', {})
-    if username not in users:
-        return None
-    user = users[username]
-    if user.get('blocked', False):
-        return None
-    if verify_password(password, user.get('password', '')):
-        return {'username': username, **user}
-    return None
-
-
-def create_user(username, name, role, manager_binding, allowed_tabs, password=None):
-    """
-    Создаёт пользователя. Возвращает сгенерированный пароль.
-    """
-    db = load_database()
-    users = db.get('users', {})
-
-    if username in users:
-        raise ValueError(f"Пользователь {username} уже существует")
-
-    if not password:
-        password = generate_password()
-
-    users[username] = {
-        'password': hash_password(password),
-        'name': name,
-        'role': role,
-        'manager_binding': manager_binding,
-        'blocked': False,
-        'allowed_tabs': allowed_tabs,
-        'last_login': None,
-    }
-    db['users'] = users
-    save_database(db)
-    return password
-
-
-def update_user(username, **kwargs):
-    """Обновление пользователя"""
-    db = load_database()
-    users = db.get('users', {})
-    if username not in users:
-        raise ValueError(f"Пользователь {username} не найден")
-
-    user = users[username]
-
-    if 'new_password' in kwargs:
-        pwd = kwargs.pop('new_password')
-        if pwd:
-            user['password'] = hash_password(pwd)
-
-    if 'blocked' in kwargs:
-        # Защита: суперадмин не может заблокировать себя
-        if username == 'superadmin' and kwargs['blocked']:
-            raise ValueError("Нельзя заблокировать суперадмина")
-        user['blocked'] = kwargs.pop('blocked')
-
-    if 'role' in kwargs:
-        if username == 'superadmin' and kwargs['role'] != 'super_admin':
-            raise ValueError("Нельзя изменить роль суперадмина")
-        user['role'] = kwargs.pop('role')
-
-    for key, value in kwargs.items():
-        user[key] = value
-
-    db['users'] = users
-    save_database(db)
-
-
-def delete_user(username):
-    """Удаление пользователя"""
-    if username == 'superadmin':
-        raise ValueError("Нельзя удалить суперадмина")
-
-    db = load_database()
-    users = db.get('users', {})
-    if username in users:
-        del users[username]
-        db['users'] = users
-        save_database(db)
-
-
-def log_login(username):
-    """Запись входа в login_history.json"""
-    import json
-    history_path = 'login_history.json'
-
-    entry = {
-        'username': username,
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
-
-    history = []
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-        except:
-            history = []
-
-    # Обрезаем: только за последний месяц
-    cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    history = [h for h in history if h.get('time', '') >= cutoff]
-    history.append(entry)
-
-    with open(history_path, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-
-def get_login_stats(username):
-    """Возвращает: последний вход, кол-во входов за месяц"""
-    import json
-    history_path = 'login_history.json'
-
-    if not os.path.exists(history_path):
-        return {'last_login': None, 'count_30d': 0}
-
-    try:
-        with open(history_path, 'r', encoding='utf-8') as f:
-            history = json.load(f)
-    except:
-        return {'last_login': None, 'count_30d': 0}
-
-    user_history = [h for h in history if h.get('username') == username]
-    if not user_history:
-        return {'last_login': None, 'count_30d': 0}
-
-    last = max(user_history, key=lambda x: x.get('time', ''))
-    return {
-        'last_login': last.get('time'),
-        'count_30d': len(user_history),
-    }
-
 def load_database():
     if os.path.exists(DB_PATH):
-        with open(DB_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return create_default_database()
+        try:
+            with open(DB_PATH, 'r', encoding='utf-8') as f:
+                db = json.load(f)
+        except Exception:
+            db = create_default_database()
+    else:
+        db = create_default_database()
+
+    users = load_users_from_gsheets()
+    if users is not None:
+        db['users'] = users
+    elif 'users' not in db:
+        db['users'] = {}
+
+    return db
 
 
 def create_default_database():
@@ -1049,17 +1021,7 @@ def create_default_database():
         "managers": {},
         "companies": {},
         "districts": {},
-        "users": {
-            "superadmin": {
-                "password": hash_password("15041976"),
-                "name": "СуперАдминистратор",
-                "role": "super_admin",
-                "manager_binding": None,
-                "blocked": False,
-                "allowed_tabs": ["all"],
-                "last_login": None,
-            }
-        },
+        "users": {},
         "settings": {
             "default_credit_limit": 5000,
             "debt_warning_days": 100,
@@ -1082,9 +1044,138 @@ def verify_password(password, hash_value):
 
 
 def save_database(db):
+    db_to_save = {k: v for k, v in db.items() if k != 'users'}
     with open(DB_PATH, 'w', encoding='utf-8') as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+        json.dump(db_to_save, f, ensure_ascii=False, indent=2)
 
+
+# === АВТОРИЗАЦИЯ ===
+
+def authenticate(username, password):
+    db = load_database()
+    users = db.get('users', {})
+    if username not in users:
+        return None
+    user = users[username]
+    if user.get('blocked', False):
+        return None
+    if verify_password(password, user.get('password', '')):
+        return {'username': username, **user}
+    return None
+
+
+def create_user(username, name, role, manager_binding, allowed_tabs, password=None):
+    users = load_users_from_gsheets() or {}
+    if username in users:
+        raise ValueError(f"Пользователь {username} уже существует")
+    if not password:
+        password = generate_password()
+
+    users[username] = {
+        'password': hash_password(password),
+        'name': name,
+        'role': role,
+        'manager_binding': manager_binding,
+        'blocked': False,
+        'allowed_tabs': allowed_tabs,
+        'last_login': None,
+    }
+    if not save_users_to_gsheets(users):
+        raise RuntimeError("Не удалось сохранить пользователя в Google Sheets")
+    return password
+
+
+def update_user(username, **kwargs):
+    users = load_users_from_gsheets() or {}
+    if username not in users:
+        raise ValueError(f"Пользователь {username} не найден")
+
+    user = users[username]
+
+    if 'new_password' in kwargs:
+        pwd = kwargs.pop('new_password')
+        if pwd:
+            user['password'] = hash_password(pwd)
+
+    if 'blocked' in kwargs:
+        if username == 'superadmin' and kwargs['blocked']:
+            raise ValueError("Нельзя заблокировать суперадмина")
+        user['blocked'] = kwargs.pop('blocked')
+
+    if 'role' in kwargs:
+        if username == 'superadmin' and kwargs['role'] != 'super_admin':
+            raise ValueError("Нельзя изменить роль суперадмина")
+        user['role'] = kwargs.pop('role')
+
+    for key, value in kwargs.items():
+        user[key] = value
+
+    users[username] = user
+    if not save_users_to_gsheets(users):
+        raise RuntimeError("Не удалось сохранить изменения в Google Sheets")
+
+
+def delete_user(username):
+    if username == 'superadmin':
+        raise ValueError("Нельзя удалить суперадмина")
+
+    users = load_users_from_gsheets() or {}
+    if username in users:
+        del users[username]
+        if not save_users_to_gsheets(users):
+            raise RuntimeError("Не удалось удалить пользователя из Google Sheets")
+
+
+# === ЛОГИ ВХОДОВ ===
+
+def log_login(username):
+    history_path = 'login_history.json'
+    entry = {
+        'username': username,
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+    history = []
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+
+    cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    history = [h for h in history if h.get('time', '') >= cutoff]
+    history.append(entry)
+
+    try:
+        with open(history_path, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Не удалось записать историю входов: {e}")
+
+
+def get_login_stats(username):
+    history_path = 'login_history.json'
+    if not os.path.exists(history_path):
+        return {'last_login': None, 'count_30d': 0}
+    try:
+        with open(history_path, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+    except Exception:
+        return {'last_login': None, 'count_30d': 0}
+
+    user_history = [h for h in history if h.get('username') == username]
+    if not user_history:
+        return {'last_login': None, 'count_30d': 0}
+
+    last = max(user_history, key=lambda x: x.get('time', ''))
+    return {
+        'last_login': last.get('time'),
+        'count_30d': len(user_history),
+    }
+
+
+# === ЗАГРУЗКА ВСЕГО ===
 
 def load_all_data(force_refresh=False):
     global _last_load, _cached_data
@@ -1092,8 +1183,7 @@ def load_all_data(force_refresh=False):
     if force_refresh or _cached_data is None or (datetime.now() - _last_load).seconds > CACHE_DURATION:
         excel_data = load_excel_data()
         if excel_data:
-            db = load_database()
-            excel_data['database'] = db
+            excel_data['database'] = load_database()
             _cached_data = excel_data
             _last_load = datetime.now()
 
