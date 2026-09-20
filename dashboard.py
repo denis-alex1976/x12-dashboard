@@ -999,15 +999,13 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
                 with col2:
                     structure_pie = structure.copy()
-                    structure_pie['amount_str'] = structure_pie['amount'].apply(format_int)
                     fig = px.pie(
                         structure_pie, values='amount', names='category',
                         color='category', color_discrete_map=cat_color_map,
-                        category_orders={'category': ['0-30', '31-60', '61-90', '91-120', '120+']},
-                        custom_data=['amount_str']
+                        category_orders={'category': ['0-30', '31-60', '61-90', '91-120', '120+']}
                     )
                     fig.update_traces(
-                        hovertemplate='<b>%{label}</b><br>%{customdata[0]} BYN<br>%{percent}<extra></extra>',
+                        hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>',
                         sort=False
                     )
                     st.plotly_chart(fig, use_container_width=True)
