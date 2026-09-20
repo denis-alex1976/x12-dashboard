@@ -1,0 +1,37 @@
+# Данные (не заливать — там пароли)
+database.json
+login_history.json
+
+# Секреты Google (появятся позже)
+service-account.json
+.streamlit/secrets.toml
+
+# Excel-файлы
+*.xlsm
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Портативный Python (если он в проекте)
+python/
+
+# Установщики
+Git-Installer.exe
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Пустой файл-ошибка
+python
