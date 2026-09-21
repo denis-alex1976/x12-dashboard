@@ -1298,30 +1298,38 @@ def delete_user(username):
 # === УТИЛИТА: IP + User-Agent из Streamlit ===
 
 def get_client_info():
-    """Возвращает dict {'ip': ..., 'user_agent': ...}."""
+    """Возвращает dict {'ip': ..., 'user_agent': ...}. Безопасно при отсутствии st.context."""
     info = {'ip': 'unknown', 'user_agent': 'unknown'}
     try:
         import streamlit as st
 
-        ip = None
+        # Проверяем, есть ли st.context (в некоторых версиях / окружениях его нет)
+        ctx = getattr(st, 'context', None)
+        if ctx is None:
+            return info
+
+        # IP
         try:
-            ip = st.context.ip_address
+            ip = getattr(ctx, 'ip_address', None)
+            if ip:
+                info['ip'] = ip
         except Exception:
             pass
 
-        if not ip:
+        # X-Forwarded-For (для облака)
+        if info['ip'] == 'unknown':
             try:
-                forwarded = st.context.headers.get("X-Forwarded-For", "")
+                headers = getattr(ctx, 'headers', None) or {}
+                forwarded = headers.get("X-Forwarded-For", "")
                 if forwarded:
-                    ip = forwarded.split(",")[0].strip()
+                    info['ip'] = forwarded.split(",")[0].strip()
             except Exception:
                 pass
 
-        if ip:
-            info['ip'] = ip
-
+        # User-Agent
         try:
-            ua = st.context.headers.get("User-Agent", "")
+            headers = getattr(ctx, 'headers', None) or {}
+            ua = headers.get("User-Agent", "")
             if ua:
                 info['user_agent'] = ua
         except Exception:
