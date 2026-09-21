@@ -41,8 +41,6 @@ ACTIVE_MANAGERS = [
     'Федук П.',
 ]
 
-# Все менеджеры, которые могут встречаться в реальных данных.
-# Используется для отсеивания служебных блоков в Excel/Google Sheets.
 ALL_MANAGERS = [
     'Бабура С.',
     'Крупенькина Е.',
@@ -79,6 +77,8 @@ GSHEETS_CREDENTIALS = "service-account.json"
 GSHEETS_SPREADSHEET_ID = "1AWSwJECekzgfvbYlBsBk-Ws78hpNp5TC7VSPdvv0Nso"
 GSHEETS_WORKSHEET = "Data"
 GSHEETS_USERS_WORKSHEET = "Users"
+GSHEETS_LOGIN_HISTORY_WORKSHEET = "LoginHistory"
+GSHEETS_BONUS_WORKSHEET = "BonusSettings"
 
 GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -87,6 +87,14 @@ GSHEETS_SCOPES = [
 
 USER_COLUMNS = ['username', 'password_hash', 'name', 'role',
                 'manager_binding', 'blocked', 'allowed_tabs']
+
+LOGIN_HISTORY_COLUMNS = ['time', 'username', 'ip', 'user_agent',
+                          'device_id', 'status', 'note']
+
+BONUS_COLUMNS = ['key', 'value']
+
+# TTL кэша пользователей (секунды)
+USERS_CACHE_TTL = 30
 
 
 # === ТРАНСЛИТЕРАЦИЯ И ПАРОЛИ ===
@@ -134,7 +142,13 @@ def generate_password(length=8):
     return ''.join(random.choice(chars) for _ in range(length))
 
 
-# === GOOGLE SHEETS ===
+# === GOOGLE SHEETS (с кэшированием) ===
+
+_gsheets_client = None
+_gsheets_spreadsheet = None
+_worksheets_cache = {}
+_users_cache = {'data': None, 'time': None}
+
 
 def _get_gsheets_creds():
     from google.oauth2.service_account import Credentials
@@ -149,40 +163,64 @@ def _get_gsheets_creds():
 
 
 def _get_gsheets_client():
-    import gspread
-    return gspread.authorize(_get_gsheets_creds())
+    """Кэшируем gspread-клиент. Один на сессию."""
+    global _gsheets_client
+    if _gsheets_client is None:
+        import gspread
+        _gsheets_client = gspread.authorize(_get_gsheets_creds())
+    return _gsheets_client
 
+
+def _get_spreadsheet():
+    """Кэшируем открытую таблицу."""
+    global _gsheets_spreadsheet
+    if _gsheets_spreadsheet is None:
+        gc = _get_gsheets_client()
+        _gsheets_spreadsheet = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
+    return _gsheets_spreadsheet
+
+
+def _get_worksheet(name):
+    """Кэшируем worksheet по имени."""
+    global _worksheets_cache
+    if name not in _worksheets_cache:
+        sh = _get_spreadsheet()
+        _worksheets_cache[name] = sh.worksheet(name)
+    return _worksheets_cache[name]
+
+
+def _invalidate_users_cache():
+    global _users_cache
+    _users_cache = {'data': None, 'time': None}
+
+
+# === ДАННЫЕ ИЗ GOOGLE SHEETS ===
 
 def load_from_gsheets():
     try:
-        gc = _get_gsheets_client()
-        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
-        worksheet = sh.worksheet(GSHEETS_WORKSHEET)
-
+        worksheet = _get_worksheet(GSHEETS_WORKSHEET)
         data = worksheet.get_all_values()
         if not data or len(data) < 2:
-            print("⚠️ Google Sheets пустой")
+            print("Google Sheets пустой")
             return None
 
         headers = data[0]
         rows = data[1:]
         df = pd.DataFrame(rows, columns=headers)
         df = df.replace('', pd.NA)
-        print(f"✅ Загружено из Google Sheets: {len(df)} строк")
+        print(f"Загружено из Google Sheets: {len(df)} строк")
         return df
     except Exception as e:
-        print(f"❌ Ошибка чтения Google Sheets: {e}")
+        print(f"Ошибка чтения Google Sheets: {e}")
         return None
 
 
 # === ПОЛЬЗОВАТЕЛИ ===
 
 def load_users_from_gsheets():
+    """Прямое чтение листа Users (без кэша)."""
     try:
-        gc = _get_gsheets_client()
-        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
-        worksheet = sh.worksheet(GSHEETS_USERS_WORKSHEET)
-
+        worksheet = _get_worksheet(GSHEETS_USERS_WORKSHEET)
         data = worksheet.get_all_values()
         if not data or len(data) < 2:
             return {}
@@ -219,15 +257,24 @@ def load_users_from_gsheets():
             }
         return users
     except Exception as e:
-        print(f"⚠️ Не удалось прочитать лист Users: {e}")
+        print(f"Не удалось прочитать лист Users: {e}")
         return None
+
+
+def load_users_cached():
+    """Чтение листа Users с TTL-кэшем (30 секунд)."""
+    global _users_cache
+    now = datetime.now()
+    if (_users_cache['time'] is None or
+            (now - _users_cache['time']).total_seconds() > USERS_CACHE_TTL):
+        _users_cache['data'] = load_users_from_gsheets()
+        _users_cache['time'] = now
+    return _users_cache['data']
 
 
 def save_users_to_gsheets(users):
     try:
-        gc = _get_gsheets_client()
-        sh = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
-        worksheet = sh.worksheet(GSHEETS_USERS_WORKSHEET)
+        worksheet = _get_worksheet(GSHEETS_USERS_WORKSHEET)
 
         rows = [USER_COLUMNS]
         for username, u in users.items():
@@ -246,9 +293,157 @@ def save_users_to_gsheets(users):
 
         worksheet.clear()
         worksheet.update(rows, value_input_option='RAW')
+        _invalidate_users_cache()
         return True
     except Exception as e:
-        print(f"❌ Ошибка записи листа Users: {e}")
+        print(f"Ошибка записи листа Users: {e}")
+        return False
+
+
+# === ИСТОРИЯ ВХОДОВ ===
+
+def log_login(username, ip=None, user_agent=None, device_id=None,
+              status='success', note=''):
+    """
+    Пишет запись о входе в Google Sheets, лист LoginHistory.
+    status: 'success' | 'failed' | 'blocked'
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
+
+        all_data = worksheet.get_all_values()
+        if not all_data:
+            worksheet.append_row(LOGIN_HISTORY_COLUMNS)
+
+        entry = [
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            username or '',
+            ip or 'unknown',
+            user_agent or 'unknown',
+            device_id or '',
+            status,
+            note,
+        ]
+        worksheet.append_row(entry, value_input_option='RAW')
+        return True
+    except Exception as e:
+        print(f"Ошибка записи в LoginHistory: {e}")
+        return False
+
+
+def get_login_stats(username):
+    """Возвращает: последний вход, кол-во за 30 дней, IP, user_agent, статус."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return {'last_login': None, 'count_30d': 0, 'last_ip': None,
+                    'last_device': None, 'last_status': None}
+
+        headers = data[0]
+        rows = data[1:]
+
+        user_rows = []
+        for row in rows:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+            if rec.get('username', '').strip() == username:
+                user_rows.append(rec)
+
+        if not user_rows:
+            return {'last_login': None, 'count_30d': 0, 'last_ip': None,
+                    'last_device': None, 'last_status': None}
+
+        user_rows.sort(key=lambda r: r.get('time', ''), reverse=True)
+        last = user_rows[0]
+
+        cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        count_30d = sum(1 for r in user_rows if r.get('time', '') >= cutoff)
+
+        return {
+            'last_login': last.get('time'),
+            'count_30d': count_30d,
+            'last_ip': last.get('ip'),
+            'last_device': last.get('user_agent'),
+            'last_status': last.get('status'),
+        }
+    except Exception as e:
+        print(f"Ошибка чтения LoginHistory: {e}")
+        return {'last_login': None, 'count_30d': 0, 'last_ip': None,
+                'last_device': None, 'last_status': None}
+
+
+def get_recent_logins(limit=50):
+    """Возвращает последние N записей из LoginHistory."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
+
+        headers = data[0]
+        rows = data[1:]
+        df = pd.DataFrame(rows, columns=headers)
+        if 'time' in df.columns:
+            df = df.sort_values('time', ascending=False).head(limit)
+        return df
+    except Exception as e:
+        print(f"Ошибка чтения LoginHistory: {e}")
+        return pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
+
+
+# === НАСТРОЙКИ БОНУСОВ (Google Sheets) ===
+
+def get_bonus_settings():
+    """Читает настройки бонусов из Google Sheets, лист BonusSettings."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return dict(DEFAULT_BONUS_SETTINGS)
+
+        for row in data[1:]:
+            if len(row) >= 2 and row[0].strip() == 'settings':
+                try:
+                    settings = json.loads(row[1])
+                    result = dict(DEFAULT_BONUS_SETTINGS)
+                    result.update(settings)
+                    return result
+                except json.JSONDecodeError:
+                    print("Не удалось распарсить JSON настроек бонусов")
+                    return dict(DEFAULT_BONUS_SETTINGS)
+
+        return dict(DEFAULT_BONUS_SETTINGS)
+    except Exception as e:
+        print(f"Ошибка чтения BonusSettings: {e}")
+        return dict(DEFAULT_BONUS_SETTINGS)
+
+
+def save_bonus_settings(settings):
+    """Сохраняет настройки бонусов в Google Sheets, лист BonusSettings."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
+        data = worksheet.get_all_values()
+
+        if not data:
+            worksheet.append_row(BONUS_COLUMNS)
+
+        json_str = json.dumps(settings, ensure_ascii=False)
+
+        found_row = None
+        for i, row in enumerate(data):
+            if len(row) >= 1 and row[0].strip() == 'settings':
+                found_row = i + 1
+                break
+
+        if found_row:
+            worksheet.update(f'B{found_row}', [[json_str]], value_input_option='RAW')
+        else:
+            worksheet.append_row(['settings', json_str], value_input_option='RAW')
+
+        return True
+    except Exception as e:
+        print(f"Ошибка сохранения BonusSettings: {e}")
         return False
 
 
@@ -275,12 +470,12 @@ def load_excel_data():
     from_gsheets = df is not None
 
     if not from_gsheets:
-        print("⚠️ Google Sheets недоступен — пробую локальный Excel...")
+        print("Google Sheets недоступен — пробую локальный Excel...")
         try:
             df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=0)
-            print(f"✅ Загружено из Excel: {len(df)} строк")
+            print(f"Загружено из Excel: {len(df)} строк")
         except Exception as e:
-            print(f"❌ Ошибка загрузки Excel: {e}")
+            print(f"Ошибка загрузки Excel: {e}")
             return None
 
     return process_data(df, from_gsheets=from_gsheets)
@@ -318,29 +513,25 @@ def process_data(df, from_gsheets=False):
                      'invoice_amount', 'payment_amount', 'order_type']
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        print(f"⚠️ Отсутствуют критичные колонки: {missing_cols}")
+        print(f"Отсутствуют критичные колонки: {missing_cols}")
         return None
 
-    # 1. Преобразование типов (важно для Google Sheets — там всё строки)
     df['invoice_date'] = pd.to_datetime(df['invoice_date'], errors='coerce')
     df['payment_date'] = pd.to_datetime(df['payment_date'], errors='coerce')
     df['invoice_amount'] = pd.to_numeric(df['invoice_amount'], errors='coerce').fillna(0)
     df['payment_amount'] = pd.to_numeric(df['payment_amount'], errors='coerce').fillna(0)
     df['order_type'] = pd.to_numeric(df['order_type'], errors='coerce').fillna(-1).astype(int)
 
-    # 2. Отсеиваем строки со служебными блоками (нет валидного менеджера)
     before = len(df)
     df = df[df['manager'].isin(ALL_MANAGERS)].copy()
     after = len(df)
     if before != after:
-        print(f"⚠️ Отсеяно служебных строк: {before - after}")
+        print(f"Отсеяно служебных строк: {before - after}")
 
-    # 3. Граница данных
     data_end = find_data_end(df)
-    print(f"✅ Граница данных: строка {data_end + 2}")
+    print(f"Граница данных: строка {data_end + 2}")
     df = df.iloc[:data_end + 1].copy()
 
-    # 4. Примечания: из Google Sheets (payment_parts) или из локального Excel
     comments_by_index = {}
 
     if from_gsheets and 'payment_parts' in df.columns:
@@ -350,23 +541,21 @@ def process_data(df, from_gsheets=False):
                 parts = parse_comment(str(text))
                 if parts:
                     comments_by_index[idx] = parts
-        print(f"✅ Примечаний из Google Sheets: {len(comments_by_index)}")
+        print(f"Примечаний из Google Sheets: {len(comments_by_index)}")
     elif _COMMENTS_AVAILABLE:
         try:
-            raw = load_comments()  # {номер_строки_Excel: [parts]}
+            raw = load_comments()
             comments_by_index = {int(k) - 2: v for k, v in raw.items()}
-            print(f"✅ Примечаний из Excel: {len(comments_by_index)}")
+            print(f"Примечаний из Excel: {len(comments_by_index)}")
         except Exception as e:
-            print(f"⚠️ Не удалось прочитать примечания: {e}")
+            print(f"Не удалось прочитать примечания: {e}")
 
-    # 5. Убираем служебную колонку payment_parts из рабочего DataFrame
     if 'payment_parts' in df.columns:
         df = df.drop(columns=['payment_parts'])
 
     sales_df = df.copy()
     sales_df['row_type'] = 'sale'
 
-    # 6. Разбивка оплат по примечаниям
     payment_rows = []
     for idx, row in df.iterrows():
         total_payment = row['payment_amount']
@@ -413,7 +602,7 @@ def process_data(df, from_gsheets=False):
     payments_only = combined[combined['row_type'] == 'payment']
     total_returns = float(payments_only['payment_amount'].sum())
 
-    print(f"✅ Строк 'sale': {len(sales_df)}, 'payment': {len(payments_df)}")
+    print(f"Строк 'sale': {len(sales_df)}, 'payment': {len(payments_df)}")
 
     return {
         'df': combined,
@@ -947,40 +1136,6 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
     return merged.sort_values('total_payments', ascending=False)
 
 
-# === НАСТРОЙКИ БОНУСОВ ===
-
-def get_bonus_settings():
-    db = load_database()
-    settings = db.get('bonus_settings')
-    if not settings:
-        old_rates = db.get('bonus_rates', {})
-        settings = dict(DEFAULT_BONUS_SETTINGS)
-        settings['rates_by_category'] = {
-            '0-30': old_rates.get('0-30', 0.0),
-            '31-60': old_rates.get('31-60', 0.0),
-            '61-90': old_rates.get('61-90', 0.0),
-            '91-120': old_rates.get('91-120', 0.0),
-            '120+': old_rates.get('120+', 0.0),
-        }
-    return settings
-
-
-def save_bonus_settings(settings):
-    db = load_database()
-    db['bonus_settings'] = settings
-    save_database(db)
-
-
-def get_bonus_rates():
-    return get_bonus_settings().get('rates_by_category', {})
-
-
-def save_bonus_rates(rates):
-    settings = get_bonus_settings()
-    settings['rates_by_category'] = rates
-    save_bonus_settings(settings)
-
-
 # === СОВМЕСТИМОСТЬ ===
 
 def get_available_months(df):
@@ -995,7 +1150,17 @@ def filter_by_period(df, period_selection, manager):
     return filter_sales(df, period_selection, manager)
 
 
-# === БАЗА ===
+def get_bonus_rates():
+    return get_bonus_settings().get('rates_by_category', {})
+
+
+def save_bonus_rates(rates):
+    settings = get_bonus_settings()
+    settings['rates_by_category'] = rates
+    save_bonus_settings(settings)
+
+
+# === БАЗА (только служебные поля; пользователи — GS) ===
 
 def load_database():
     if os.path.exists(DB_PATH):
@@ -1007,7 +1172,7 @@ def load_database():
     else:
         db = create_default_database()
 
-    users = load_users_from_gsheets()
+    users = load_users_cached()
     if users is not None:
         db['users'] = users
     elif 'users' not in db:
@@ -1052,13 +1217,17 @@ def save_database(db):
 # === АВТОРИЗАЦИЯ ===
 
 def authenticate(username, password):
+    """
+    Возвращает dict пользователя или None.
+    Если пользователь заблокирован — возвращает dict с '_blocked': True.
+    """
     db = load_database()
     users = db.get('users', {})
     if username not in users:
         return None
     user = users[username]
     if user.get('blocked', False):
-        return None
+        return {'username': username, **user, '_blocked': True}
     if verify_password(password, user.get('password', '')):
         return {'username': username, **user}
     return None
@@ -1126,53 +1295,41 @@ def delete_user(username):
             raise RuntimeError("Не удалось удалить пользователя из Google Sheets")
 
 
-# === ЛОГИ ВХОДОВ ===
+# === УТИЛИТА: IP + User-Agent из Streamlit ===
 
-def log_login(username):
-    history_path = 'login_history.json'
-    entry = {
-        'username': username,
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
+def get_client_info():
+    """Возвращает dict {'ip': ..., 'user_agent': ...}."""
+    info = {'ip': 'unknown', 'user_agent': 'unknown'}
+    try:
+        import streamlit as st
 
-    history = []
-    if os.path.exists(history_path):
+        ip = None
         try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
+            ip = st.context.ip_address
         except Exception:
-            history = []
+            pass
 
-    cutoff = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    history = [h for h in history if h.get('time', '') >= cutoff]
-    history.append(entry)
+        if not ip:
+            try:
+                forwarded = st.context.headers.get("X-Forwarded-For", "")
+                if forwarded:
+                    ip = forwarded.split(",")[0].strip()
+            except Exception:
+                pass
 
-    try:
-        with open(history_path, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Не удалось записать историю входов: {e}")
+        if ip:
+            info['ip'] = ip
 
-
-def get_login_stats(username):
-    history_path = 'login_history.json'
-    if not os.path.exists(history_path):
-        return {'last_login': None, 'count_30d': 0}
-    try:
-        with open(history_path, 'r', encoding='utf-8') as f:
-            history = json.load(f)
+        try:
+            ua = st.context.headers.get("User-Agent", "")
+            if ua:
+                info['user_agent'] = ua
+        except Exception:
+            pass
     except Exception:
-        return {'last_login': None, 'count_30d': 0}
+        pass
 
-    user_history = [h for h in history if h.get('username') == username]
-    if not user_history:
-        return {'last_login': None, 'count_30d': 0}
-
-    last = max(user_history, key=lambda x: x.get('time', ''))
-    return {
-        'last_login': last.get('time'),
-        'count_30d': len(user_history),
-    }
+    return info
 
 
 # === ЗАГРУЗКА ВСЕГО ===

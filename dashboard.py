@@ -57,8 +57,6 @@ STATUS_COLORS = {
     '120+': '#C0392B',
 }
 
-# === ВКЛАДКИ ===
-
 USER_TABS = [
     ('tab1', "🏢 Предприятия"),
     ('tab2', "📍 Районы"),
@@ -92,7 +90,6 @@ def format_int(value):
 
 
 def tab_key_to_name(key):
-    """Ключ вкладки → человекочитаемое название."""
     for k, v in USER_TABS + ADMIN_TABS:
         if k == key:
             return v
@@ -102,13 +99,29 @@ def tab_key_to_name(key):
 
 
 def tabs_to_display(keys):
-    """Список ключей → строка с названиями."""
     if not keys:
         return '—'
     if 'all' in keys:
         return 'Все вкладки'
     names = [tab_key_to_name(k) for k in keys]
     return ', '.join(names)
+
+
+def short_ua(ua):
+    """Короткое представление User-Agent."""
+    if not ua or ua == 'unknown':
+        return '—'
+    if 'Edg' in ua:
+        return 'Edge'
+    if 'Chrome' in ua and 'Safari' in ua:
+        return 'Chrome'
+    if 'Firefox' in ua:
+        return 'Firefox'
+    if 'Safari' in ua:
+        return 'Safari'
+    if 'Mobile' in ua:
+        return 'Mobile'
+    return ua[:40] + ('...' if len(ua) > 40 else '')
 
 
 @st.cache_data(ttl=600)
@@ -134,17 +147,34 @@ def check_auth():
             submitted = st.form_submit_button("Войти", use_container_width=True)
 
         if submitted:
+            client_info = data_loader.get_client_info()
+            ip = client_info.get('ip', 'unknown')
+            ua = client_info.get('user_agent', 'unknown')
+
             user = data_loader.authenticate(username, password)
             if user:
-                st.session_state.authenticated = True
-                st.session_state.username = username
-                st.session_state.role = user['role']
-                st.session_state.manager_binding = user.get('manager_binding')
-                st.session_state.allowed_tabs = user.get('allowed_tabs', [])
-                data_loader.log_login(username)
-                st.rerun()
+                if user.get('_blocked'):
+                    st.error("❌ Пользователь заблокирован")
+                    data_loader.log_login(
+                        username, ip=ip, user_agent=ua, status='blocked',
+                        note='Попытка входа заблокированного пользователя'
+                    )
+                else:
+                    st.session_state.authenticated = True
+                    st.session_state.username = username
+                    st.session_state.role = user['role']
+                    st.session_state.manager_binding = user.get('manager_binding')
+                    st.session_state.allowed_tabs = user.get('allowed_tabs', [])
+                    data_loader.log_login(
+                        username, ip=ip, user_agent=ua, status='success'
+                    )
+                    st.rerun()
             else:
-                st.error("❌ Неверный логин или пароль, либо пользователь заблокирован")
+                st.error("❌ Неверный логин или пароль")
+                data_loader.log_login(
+                    username, ip=ip, user_agent=ua, status='failed',
+                    note='Неверный логин или пароль'
+                )
 
         return False
 
@@ -161,7 +191,6 @@ def render_access_tab():
     db = data_loader.load_database()
     users = db.get('users', {})
 
-    # === KPI ===
     total_users = len(users)
     active_users = sum(1 for u in users.values() if not u.get('blocked', False))
     blocked_users = total_users - active_users
@@ -176,7 +205,7 @@ def render_access_tab():
 
     st.divider()
 
-    # === ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ===
+    # === ДОБАВЛЕНИЕ ===
     with st.expander("➕ Добавить пользователя", expanded=False):
         managers_list = data_loader.get_available_managers()
         managers_list = [m for m in managers_list if m != 'Все менеджеры']
@@ -235,7 +264,7 @@ def render_access_tab():
 
     st.divider()
 
-    # === ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ ===
+    # === ТАБЛИЦА ===
     st.subheader("👥 Пользователи")
 
     if not users:
@@ -245,6 +274,11 @@ def render_access_tab():
         for uname, u in users.items():
             stats = data_loader.get_login_stats(uname)
             last_login = stats.get('last_login') or '—'
+            last_ip = stats.get('last_ip') or '—'
+            last_status = stats.get('last_status') or '—'
+            status_map = {'success': '✅', 'failed': '❌', 'blocked': '🚫'}
+            last_status_icon = status_map.get(last_status, '—')
+
             rows.append({
                 'Логин': uname,
                 'Имя': u.get('name', ''),
@@ -253,6 +287,8 @@ def render_access_tab():
                 'Вкладки': tabs_to_display(u.get('allowed_tabs', [])),
                 'Статус': '🚫 Заблокирован' if u.get('blocked') else '✅ Активен',
                 'Последний вход': last_login,
+                'IP': last_ip,
+                'Вход': last_status_icon,
                 'Входов / 30д': stats.get('count_30d', 0),
             })
 
@@ -356,7 +392,7 @@ def render_access_tab():
                 if st.button(btn_label, use_container_width=True, key="toggle_block_btn"):
                     try:
                         data_loader.update_user(selected_user, blocked=not is_blocked)
-                        st.success(f"✅ Статус изменён")
+                        st.success("✅ Статус изменён")
                         st.cache_data.clear()
                         st.rerun()
                     except Exception as e:
@@ -413,22 +449,25 @@ def render_access_tab():
     # === ЖУРНАЛ ВХОДОВ ===
     st.subheader("📜 Журнал входов (последние 20)")
 
-    history_path = 'login_history.json'
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            history = sorted(history, key=lambda x: x.get('time', ''), reverse=True)[:20]
-            if history:
-                df_hist = pd.DataFrame(history)
-                df_hist.columns = ['Пользователь', 'Время']
-                st.dataframe(df_hist, use_container_width=True, hide_index=True)
-            else:
-                st.info("Журнал пуст")
-        except Exception as e:
-            st.error(f"Ошибка чтения журнала: {e}")
-    else:
-        st.info("Журнал входов пока пуст")
+    try:
+        df_hist = data_loader.get_recent_logins(limit=20)
+        if not df_hist.empty:
+            display = df_hist.copy()
+            if 'user_agent' in display.columns:
+                display['user_agent'] = display['user_agent'].apply(short_ua)
+            cols_order = ['time', 'username', 'status', 'ip', 'user_agent', 'note']
+            cols_order = [c for c in cols_order if c in display.columns]
+            display = display[cols_order]
+            col_names = {
+                'time': 'Время', 'username': 'Пользователь', 'status': 'Статус',
+                'ip': 'IP', 'user_agent': 'Устройство', 'note': 'Примечание',
+            }
+            display = display.rename(columns=col_names)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+        else:
+            st.info("Журнал пуст")
+    except Exception as e:
+        st.error(f"Ошибка чтения журнала: {e}")
 
 
 # ============================================================
@@ -442,7 +481,7 @@ def main():
     data = load_data()
 
     if not data:
-        st.error("❌ Не удалось загрузить данные из Excel")
+        st.error("❌ Не удалось загрузить данные")
         return
 
     df = data.get('df')
@@ -649,10 +688,9 @@ def main():
 
     st.divider()
 
-    # ===== ТОП-3 =====
+    # ===== ТОП-3 (всегда по всем менеджерам) =====
     st.subheader("🏆 ТОП-3 менеджера")
 
-    # Для ТОП-3 всегда берём ВСЕХ менеджеров (независимо от фильтра)
     all_sales = data_loader.filter_sales(df, selected_periods, 'Все менеджеры')
     all_payments = data_loader.filter_payments(df, selected_periods, 'Все менеджеры')
 
@@ -708,7 +746,6 @@ def main():
     else:
         visible_user_tabs = [(k, v) for k, v in USER_TABS if k in user_tabs]
 
-    # Вкладка «Доступы» — только super_admin, жёстко
     if user_role == 'super_admin':
         visible_tabs = list(visible_user_tabs) + list(ADMIN_TABS)
     else:
@@ -1194,10 +1231,7 @@ def main():
                 display.columns = ['Менеджер', 'Оплаты, BYN', 'Доля, %', 'Бонус, BYN', 'Кол-во оплат']
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
-                # Pie по долям
                 pie_data = by_mgr_pay[by_mgr_pay['payments'] > 0].copy()
-                pie_data['payments_str'] = pie_data['payments'].apply(format_int)
-
                 fig = px.pie(
                     pie_data,
                     values='payments', names='manager',
@@ -1323,12 +1357,14 @@ def main():
                         {'min_amount': t3_amount, 'rate': t3_rate},
                     ],
                 }
-                data_loader.save_bonus_settings(new_settings)
-                st.success("✅ Настройки бонусов сохранены")
-                st.cache_data.clear()
-                st.rerun()
+                if data_loader.save_bonus_settings(new_settings):
+                    st.success("✅ Настройки бонусов сохранены в Google Sheets")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("❌ Не удалось сохранить настройки")
 
-    # ===== TAB_ACCESS: ДОСТУПЫ =====
+    # ===== TAB_ACCESS =====
     if 'tab_access' in tab_map:
         with tab_map['tab_access']:
             render_access_tab()
