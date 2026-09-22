@@ -72,6 +72,27 @@ DEFAULT_BONUS_SETTINGS = {
     ],
 }
 
+DEFAULT_ADMIN_SETTINGS = {
+    'allow_admins_blacklist': True,
+    'allow_admins_golden': True,
+    'allow_admins_potential_days': True,
+    'allow_admins_trust_limits': True,
+    'show_trust_limits': True,
+    'new_status_days': 30,
+    'returned_days': 300,
+    'passive_days': 300,
+    'potential_warning_days': 90,
+    'inactive_days': 60,
+    'debtor_days': 90,
+    'debtor_threshold': 2,
+}
+
+DEFAULT_TRUST_LIMITS = {
+    'threshold_1': 5000.0,
+    'threshold_2': 7000.0,
+    'threshold_3': 10000.0,
+}
+
 # === GOOGLE SHEETS ===
 GSHEETS_CREDENTIALS = "service-account.json"
 GSHEETS_SPREADSHEET_ID = "1AWSwJECekzgfvbYlBsBk-Ws78hpNp5TC7VSPdvv0Nso"
@@ -79,6 +100,8 @@ GSHEETS_WORKSHEET = "Data"
 GSHEETS_USERS_WORKSHEET = "Users"
 GSHEETS_LOGIN_HISTORY_WORKSHEET = "LoginHistory"
 GSHEETS_BONUS_WORKSHEET = "BonusSettings"
+GSHEETS_COMPANY_FLAGS_WORKSHEET = "CompanyFlags"
+GSHEETS_TRUST_LIMITS_WORKSHEET = "TrustLimits"
 
 GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -93,7 +116,12 @@ LOGIN_HISTORY_COLUMNS = ['time', 'username', 'ip', 'user_agent',
 
 BONUS_COLUMNS = ['key', 'value']
 
-# TTL кэша пользователей (секунды)
+COMPANY_FLAGS_COLUMNS = ['company_code', 'company_name', 'blacklist',
+                          'golden_fund', 'status', 'status_date',
+                          'date_added', 'added_by']
+
+TRUST_LIMITS_COLUMNS = ['threshold', 'amount']
+
 USERS_CACHE_TTL = 30
 
 
@@ -148,6 +176,8 @@ _gsheets_client = None
 _gsheets_spreadsheet = None
 _worksheets_cache = {}
 _users_cache = {'data': None, 'time': None}
+_summary_cache = {'data': None, 'time': None}
+SUMMARY_TTL = 300  # 5 минут
 
 
 def _get_gsheets_creds():
@@ -163,7 +193,6 @@ def _get_gsheets_creds():
 
 
 def _get_gsheets_client():
-    """Кэшируем gspread-клиент. Один на сессию."""
     global _gsheets_client
     if _gsheets_client is None:
         import gspread
@@ -172,7 +201,6 @@ def _get_gsheets_client():
 
 
 def _get_spreadsheet():
-    """Кэшируем открытую таблицу."""
     global _gsheets_spreadsheet
     if _gsheets_spreadsheet is None:
         gc = _get_gsheets_client()
@@ -181,7 +209,6 @@ def _get_spreadsheet():
 
 
 def _get_worksheet(name):
-    """Кэшируем worksheet по имени."""
     global _worksheets_cache
     if name not in _worksheets_cache:
         sh = _get_spreadsheet()
@@ -192,6 +219,11 @@ def _get_worksheet(name):
 def _invalidate_users_cache():
     global _users_cache
     _users_cache = {'data': None, 'time': None}
+
+
+def _invalidate_summary_cache():
+    global _summary_cache
+    _summary_cache = {'data': None, 'time': None}
 
 
 # === ДАННЫЕ ИЗ GOOGLE SHEETS ===
@@ -218,7 +250,6 @@ def load_from_gsheets():
 # === ПОЛЬЗОВАТЕЛИ ===
 
 def load_users_from_gsheets():
-    """Прямое чтение листа Users (без кэша)."""
     try:
         worksheet = _get_worksheet(GSHEETS_USERS_WORKSHEET)
         data = worksheet.get_all_values()
@@ -262,7 +293,6 @@ def load_users_from_gsheets():
 
 
 def load_users_cached():
-    """Чтение листа Users с TTL-кэшем (30 секунд)."""
     global _users_cache
     now = datetime.now()
     if (_users_cache['time'] is None or
@@ -304,10 +334,6 @@ def save_users_to_gsheets(users):
 
 def log_login(username, ip=None, user_agent=None, device_id=None,
               status='success', note=''):
-    """
-    Пишет запись о входе в Google Sheets, лист LoginHistory.
-    status: 'success' | 'failed' | 'blocked'
-    """
     try:
         worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
 
@@ -332,7 +358,6 @@ def log_login(username, ip=None, user_agent=None, device_id=None,
 
 
 def get_login_stats(username):
-    """Возвращает: последний вход, кол-во за 30 дней, IP, user_agent, статус."""
     try:
         worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
         data = worksheet.get_all_values()
@@ -374,7 +399,6 @@ def get_login_stats(username):
 
 
 def get_recent_logins(limit=50):
-    """Возвращает последние N записей из LoginHistory."""
     try:
         worksheet = _get_worksheet(GSHEETS_LOGIN_HISTORY_WORKSHEET)
         data = worksheet.get_all_values()
@@ -392,10 +416,9 @@ def get_recent_logins(limit=50):
         return pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
 
 
-# === НАСТРОЙКИ БОНУСОВ (Google Sheets) ===
+# === НАСТРОЙКИ БОНУСОВ И ADMIN_SETTINGS ===
 
 def get_bonus_settings():
-    """Читает настройки бонусов из Google Sheets, лист BonusSettings."""
     try:
         worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
         data = worksheet.get_all_values()
@@ -420,7 +443,6 @@ def get_bonus_settings():
 
 
 def save_bonus_settings(settings):
-    """Сохраняет настройки бонусов в Google Sheets, лист BonusSettings."""
     try:
         worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
         data = worksheet.get_all_values()
@@ -444,6 +466,181 @@ def save_bonus_settings(settings):
         return True
     except Exception as e:
         print(f"Ошибка сохранения BonusSettings: {e}")
+        return False
+
+
+def get_admin_settings():
+    """Читает admin_settings из BonusSettings (строка 'admin_settings')."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return dict(DEFAULT_ADMIN_SETTINGS)
+
+        for row in data[1:]:
+            if len(row) >= 2 and row[0].strip() == 'admin_settings':
+                try:
+                    settings = json.loads(row[1])
+                    result = dict(DEFAULT_ADMIN_SETTINGS)
+                    result.update(settings)
+                    return result
+                except json.JSONDecodeError:
+                    print("Не удалось распарсить admin_settings")
+                    return dict(DEFAULT_ADMIN_SETTINGS)
+
+        return dict(DEFAULT_ADMIN_SETTINGS)
+    except Exception as e:
+        print(f"Ошибка чтения admin_settings: {e}")
+        return dict(DEFAULT_ADMIN_SETTINGS)
+
+
+def save_admin_settings(settings):
+    """Сохраняет admin_settings в BonusSettings (строка 'admin_settings')."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_BONUS_WORKSHEET)
+        data = worksheet.get_all_values()
+
+        if not data:
+            worksheet.append_row(BONUS_COLUMNS)
+
+        json_str = json.dumps(settings, ensure_ascii=False)
+
+        found_row = None
+        for i, row in enumerate(data):
+            if len(row) >= 1 and row[0].strip() == 'admin_settings':
+                found_row = i + 1
+                break
+
+        if found_row:
+            worksheet.update(f'B{found_row}', [[json_str]], value_input_option='RAW')
+        else:
+            worksheet.append_row(['admin_settings', json_str], value_input_option='RAW')
+
+        _invalidate_summary_cache()
+        return True
+    except Exception as e:
+        print(f"Ошибка сохранения admin_settings: {e}")
+        return False
+
+
+# === COMPANY FLAGS ===
+
+def load_company_flags():
+    """
+    Читает лист CompanyFlags.
+    Возвращает dict {company_code: {...}}.
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_COMPANY_FLAGS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return {}
+
+        headers = data[0]
+        flags = {}
+        for row in data[1:]:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+
+            code = rec.get('company_code', '').strip()
+            if not code:
+                continue
+
+            blacklist = rec.get('blacklist', '').strip().upper() in ('TRUE', '1', 'YES', 'ДА')
+            golden_fund = rec.get('golden_fund', '').strip().upper() in ('TRUE', '1', 'YES', 'ДА')
+
+            flags[code] = {
+                'company_name': rec.get('company_name', '').strip(),
+                'blacklist': blacklist,
+                'golden_fund': golden_fund,
+                'status': rec.get('status', '').strip(),
+                'status_date': rec.get('status_date', '').strip(),
+                'date_added': rec.get('date_added', '').strip(),
+                'added_by': rec.get('added_by', '').strip(),
+            }
+        return flags
+    except Exception as e:
+        print(f"Ошибка чтения CompanyFlags: {e}")
+        return {}
+
+
+def save_company_flags(flags):
+    """Перезаписывает лист CompanyFlags."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_COMPANY_FLAGS_WORKSHEET)
+
+        rows = [COMPANY_FLAGS_COLUMNS]
+        for code, f in flags.items():
+            rows.append([
+                code,
+                f.get('company_name', ''),
+                'TRUE' if f.get('blacklist') else 'FALSE',
+                'TRUE' if f.get('golden_fund') else 'FALSE',
+                f.get('status', ''),
+                f.get('status_date', ''),
+                f.get('date_added', ''),
+                f.get('added_by', ''),
+            ])
+
+        worksheet.clear()
+        worksheet.update(rows, value_input_option='RAW')
+        _invalidate_summary_cache()
+        return True
+    except Exception as e:
+        print(f"Ошибка записи CompanyFlags: {e}")
+        return False
+
+
+# === TRUST LIMITS ===
+
+def load_trust_limits():
+    """
+    Читает лист TrustLimits.
+    Возвращает dict {'threshold_1': 5000, 'threshold_2': 7000, 'threshold_3': 10000}.
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_TRUST_LIMITS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return dict(DEFAULT_TRUST_LIMITS)
+
+        headers = data[0]
+        limits = dict(DEFAULT_TRUST_LIMITS)
+        for row in data[1:]:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+
+            key = rec.get('threshold', '').strip()
+            if not key:
+                continue
+
+            try:
+                amount = float(str(rec.get('amount', '0')).replace(',', '.').replace(' ', ''))
+                limits[key] = amount
+            except (ValueError, TypeError):
+                pass
+
+        return limits
+    except Exception as e:
+        print(f"Ошибка чтения TrustLimits: {e}")
+        return dict(DEFAULT_TRUST_LIMITS)
+
+
+def save_trust_limits(limits):
+    """Перезаписывает лист TrustLimits."""
+    try:
+        worksheet = _get_worksheet(GSHEETS_TRUST_LIMITS_WORKSHEET)
+
+        rows = [TRUST_LIMITS_COLUMNS]
+        for key in ['threshold_1', 'threshold_2', 'threshold_3']:
+            rows.append([key, limits.get(key, 0.0)])
+
+        worksheet.clear()
+        worksheet.update(rows, value_input_option='RAW')
+        _invalidate_summary_cache()
+        return True
+    except Exception as e:
+        print(f"Ошибка записи TrustLimits: {e}")
         return False
 
 
@@ -483,6 +680,7 @@ def load_excel_data():
 
 def process_data(df, from_gsheets=False):
     column_mapping = {
+        'Код хоз-ва': 'company_code',      # ← НОВОЕ
         'Наименование хозяйства': 'company',
         'Область': 'oblast',
         'Район': 'raion',
@@ -509,7 +707,7 @@ def process_data(df, from_gsheets=False):
 
     df = df.rename(columns=rename_map)
 
-    required_cols = ['company', 'manager', 'invoice_num', 'invoice_date',
+    required_cols = ['company_code', 'company', 'manager', 'invoice_num', 'invoice_date',
                      'invoice_amount', 'payment_amount', 'order_type']
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
@@ -590,7 +788,8 @@ def process_data(df, from_gsheets=False):
     combined = pd.concat([sales_df, payments_df], ignore_index=True)
     combined['payment_date'] = combined['payment_date'].fillna(combined['invoice_date'])
 
-    keep_cols = ['company', 'oblast', 'raion', 'manager', 'research_type',
+    # company_code — первым
+    keep_cols = ['company_code', 'company', 'oblast', 'raion', 'manager', 'research_type',
                  'invoice_num', 'invoice_date', 'invoice_amount',
                  'payment_amount', 'payment_date', 'order_type', 'row_type']
     combined = combined[keep_cols].copy()
@@ -753,12 +952,12 @@ def get_avg_check(df_sales):
 
 def get_sales_by_company(df_sales):
     if df_sales is None or df_sales.empty:
-        return pd.DataFrame(columns=['company', 'raion', 'oblast', 'manager', 'amount'])
+        return pd.DataFrame(columns=['company_code', 'company', 'raion', 'oblast', 'manager', 'amount'])
     sales = df_sales[df_sales['order_type'] == 0]
     if sales.empty:
-        return pd.DataFrame(columns=['company', 'raion', 'oblast', 'manager', 'amount'])
-    result = sales.groupby(['company', 'raion', 'oblast', 'manager'])['invoice_amount'].sum().reset_index()
-    result.columns = ['company', 'raion', 'oblast', 'manager', 'amount']
+        return pd.DataFrame(columns=['company_code', 'company', 'raion', 'oblast', 'manager', 'amount'])
+    result = sales.groupby(['company_code', 'company', 'raion', 'oblast', 'manager'])['invoice_amount'].sum().reset_index()
+    result.columns = ['company_code', 'company', 'raion', 'oblast', 'manager', 'amount']
     return result.sort_values('amount', ascending=False)
 
 
@@ -860,7 +1059,7 @@ def get_debt_data(df, period_selection=None, manager=None):
     payments_grouped = payments_all.groupby(['company', 'invoice_num', 'invoice_date'])['payment_amount'].sum().reset_index()
     payments_grouped.columns = ['company', 'invoice_num', 'invoice_date', 'paid_amount']
 
-    sales_grouped = sales.groupby(['company', 'manager', 'raion', 'oblast',
+    sales_grouped = sales.groupby(['company_code', 'company', 'manager', 'raion', 'oblast',
                                    'invoice_num', 'invoice_date']).agg({
         'invoice_amount': 'sum'
     }).reset_index()
@@ -944,10 +1143,10 @@ def get_debt_companies(df, period_selection=None, manager=None):
     if debt_df.empty:
         return pd.DataFrame()
 
-    result = debt_df.groupby(['company', 'manager']).agg({
+    result = debt_df.groupby(['company_code', 'company', 'manager']).agg({
         'debt_amount': 'sum'
     }).reset_index()
-    result.columns = ['company', 'manager', 'total_debt']
+    result.columns = ['company_code', 'company', 'manager', 'total_debt']
 
     pivot = debt_df.pivot_table(
         index='company',
@@ -1105,17 +1304,17 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
     else:
         payments['bonus'] = 0.0
 
-    result = payments.groupby(['company', 'manager', 'category']).agg({
+    result = payments.groupby(['company_code', 'company', 'manager', 'category']).agg({
         'payment_amount': 'sum',
         'bonus': 'sum'
     }).reset_index()
 
     pivot_amount = result.pivot_table(
-        index=['company', 'manager'], columns='category', values='payment_amount',
+        index=['company_code', 'company', 'manager'], columns='category', values='payment_amount',
         aggfunc='sum', fill_value=0
     ).reset_index()
     pivot_bonus = result.pivot_table(
-        index=['company', 'manager'], columns='category', values='bonus',
+        index=['company_code', 'company', 'manager'], columns='category', values='bonus',
         aggfunc='sum', fill_value=0
     ).reset_index()
 
@@ -1129,9 +1328,9 @@ def get_payments_companies(df, period_selection=None, manager=None, bonus_settin
     pivot_amount['total_payments'] = pivot_amount[order].sum(axis=1)
     pivot_bonus['total_bonus'] = pivot_bonus[order].sum(axis=1)
 
-    merged = pivot_amount[['company', 'manager', 'total_payments'] + order].merge(
-        pivot_bonus[['company', 'manager', 'total_bonus']],
-        on=['company', 'manager'], how='left'
+    merged = pivot_amount[['company_code', 'company', 'manager', 'total_payments'] + order].merge(
+        pivot_bonus[['company_code', 'company', 'manager', 'total_bonus']],
+        on=['company_code', 'company', 'manager'], how='left'
     )
     return merged.sort_values('total_payments', ascending=False)
 
@@ -1160,7 +1359,7 @@ def save_bonus_rates(rates):
     save_bonus_settings(settings)
 
 
-# === БАЗА (только служебные поля; пользователи — GS) ===
+# === БАЗА ===
 
 def load_database():
     if os.path.exists(DB_PATH):
@@ -1217,10 +1416,6 @@ def save_database(db):
 # === АВТОРИЗАЦИЯ ===
 
 def authenticate(username, password):
-    """
-    Возвращает dict пользователя или None.
-    Если пользователь заблокирован — возвращает dict с '_blocked': True.
-    """
     db = load_database()
     users = db.get('users', {})
     if username not in users:
@@ -1298,17 +1493,14 @@ def delete_user(username):
 # === УТИЛИТА: IP + User-Agent из Streamlit ===
 
 def get_client_info():
-    """Возвращает dict {'ip': ..., 'user_agent': ...}. Безопасно при отсутствии st.context."""
     info = {'ip': 'unknown', 'user_agent': 'unknown'}
     try:
         import streamlit as st
 
-        # Проверяем, есть ли st.context (в некоторых версиях / окружениях его нет)
         ctx = getattr(st, 'context', None)
         if ctx is None:
             return info
 
-        # IP
         try:
             ip = getattr(ctx, 'ip_address', None)
             if ip:
@@ -1316,7 +1508,6 @@ def get_client_info():
         except Exception:
             pass
 
-        # X-Forwarded-For (для облака)
         if info['ip'] == 'unknown':
             try:
                 headers = getattr(ctx, 'headers', None) or {}
@@ -1326,7 +1517,6 @@ def get_client_info():
             except Exception:
                 pass
 
-        # User-Agent
         try:
             headers = getattr(ctx, 'headers', None) or {}
             ua = headers.get("User-Agent", "")
@@ -1338,6 +1528,373 @@ def get_client_info():
         pass
 
     return info
+
+
+# === РАСЧЁТ СТАТУСОВ И МЕТОК ПРЕДПРИЯТИЙ ===
+
+def get_company_metrics(company_code, df_company, flags, admin_settings, trust_limits):
+    """
+    Вычисляет метрики одного предприятия.
+
+    df_company — DataFrame со счетами/оплатами ТОЛЬКО этого предприятия.
+    flags — dict с метками из CompanyFlags для этого кода.
+    admin_settings — dict.
+    trust_limits — dict {'threshold_1': 5000, ...}.
+
+    Возвращает dict с метриками.
+    """
+    today = pd.Timestamp.now()
+
+    # Только счета (order_type == 0)
+    sales = df_company[
+        (df_company['row_type'] == 'sale') &
+        (df_company['order_type'] == 0)
+    ].copy()
+
+    # Оплаты
+    payments = df_company[df_company['row_type'] == 'payment'].copy()
+
+    result = {
+        'company_code': company_code,
+        'company_name': None,
+        'manager': None,
+        'oblast': None,
+        'raion': None,
+        'invoices_count': 0,
+        'first_invoice_date': None,
+        'last_invoice_date': None,
+        'days_since_last': None,
+        'debt_amount': 0.0,
+        'debt_days_max': 0,
+        'status': 'working',
+        'metki': [],
+        'category': 'working',
+    }
+
+    # Если нет счетов — «Пассивное» (или ручное «Потенциальное»)
+    if sales.empty:
+        if flags.get('status') == 'potential':
+            result['status'] = 'potential'
+            result['category'] = 'potential'
+        else:
+            result['status'] = 'passive'
+            result['category'] = 'passive'
+        return result
+
+    # Основные поля
+    # Компания — из первой строки
+    first_row = sales.iloc[0]
+    result['company_name'] = first_row.get('company')
+    result['oblast'] = first_row.get('oblast')
+    result['raion'] = first_row.get('raion')
+
+    # Менеджер — из ПОСЛЕДНЕГО счёта (самый свежий)
+    sales_sorted = sales.sort_values('invoice_date', ascending=False)
+    last_row = sales_sorted.iloc[0]
+    result['manager'] = last_row.get('manager')
+
+    invoice_dates = sales['invoice_date'].dropna().sort_values()
+    if len(invoice_dates) > 0:
+        result['first_invoice_date'] = invoice_dates.iloc[0]
+        result['last_invoice_date'] = invoice_dates.iloc[-1]
+        result['days_since_last'] = (today - invoice_dates.iloc[-1]).days
+        result['invoices_count'] = len(invoice_dates)
+
+    # === РАСЧЁТ ДЕБИТОРКИ ===
+    # Группируем счета по invoice_num
+    sales_grouped = sales.groupby('invoice_num').agg({
+        'invoice_amount': 'sum',
+        'invoice_date': 'max',
+    }).reset_index()
+
+    # Группируем оплаты по invoice_num
+    if not payments.empty:
+        pay_grouped = payments.groupby('invoice_num')['payment_amount'].sum().reset_index()
+        pay_grouped.columns = ['invoice_num', 'paid_amount']
+        merged = sales_grouped.merge(pay_grouped, on='invoice_num', how='left').fillna({'paid_amount': 0})
+    else:
+        merged = sales_grouped.copy()
+        merged['paid_amount'] = 0.0
+
+    merged['debt'] = merged['invoice_amount'] - merged['paid_amount']
+    unpaid = merged[merged['debt'] > 0.5].copy()
+
+    if not unpaid.empty:
+        result['debt_amount'] = float(unpaid['debt'].sum())
+        unpaid['days'] = unpaid['invoice_date'].apply(
+            lambda d: (today - d).days if pd.notna(d) else 0
+        )
+        result['debt_days_max'] = int(unpaid['days'].max())
+
+    # === СТАТУС ===
+    result['status'] = calculate_company_status(
+        invoice_dates=invoice_dates,
+        flags=flags,
+        admin_settings=admin_settings,
+        today=today,
+    )
+
+    # === МЕТКИ ===
+    result['metki'] = calculate_company_metki(
+        result=result,
+        flags=flags,
+        admin_settings=admin_settings,
+        trust_limits=trust_limits,
+    )
+
+    # === КАТЕГОРИЯ (для круговой) ===
+    result['category'] = get_priority_category(result, flags)
+
+    return result
+
+
+def calculate_company_status(invoice_dates, flags, admin_settings, today):
+    """
+    Вычисляет статус предприятия.
+
+    Приоритет:
+    1. potential (ручной)
+    2. new — 1 счёт И первый счёт в текущем календарном месяце
+    3. returned — есть счёт в текущем месяце + перерыв >= returned_days
+    4. passive — нет счетов > passive_days
+    5. working — всё остальное
+    """
+    if flags.get('status') == 'potential':
+        return 'potential'
+
+    if len(invoice_dates) == 0:
+        return 'passive'
+
+    current_month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    first_invoice = invoice_dates.iloc[0]
+    last_invoice = invoice_dates.iloc[-1]
+    days_since_last = (today - last_invoice).days
+
+    # === НОВОЕ ===
+    if len(invoice_dates) == 1:
+        if first_invoice >= current_month_start:
+            return 'new'
+        if days_since_last > admin_settings.get('passive_days', 300):
+            return 'passive'
+        return 'working'
+
+    # === ВЕРНУВШЕЕСЯ ===
+    has_invoice_current_month = any(d >= current_month_start for d in invoice_dates)
+    if has_invoice_current_month:
+        gaps = invoice_dates.diff().dt.days.dropna()
+        if len(gaps) > 0 and gaps.max() >= admin_settings.get('returned_days', 300):
+            return 'returned'
+
+    # === ПАССИВНОЕ ===
+    if days_since_last > admin_settings.get('passive_days', 300):
+        return 'passive'
+
+    return 'working'
+
+
+def calculate_company_metki(result, flags, admin_settings, trust_limits):
+    """
+    Возвращает список меток для предприятия.
+    result — dict с метриками из get_company_metrics.
+    """
+    metki = []
+
+    # 1. ЧС — исключение
+    if flags.get('blacklist'):
+        return ['💀']
+
+    # 2. Золотой фонд
+    if flags.get('golden_fund'):
+        metki.append('🏆')
+
+    # 3. Дебиторка / Должник
+    debt = result.get('debt_amount', 0.0)
+    debt_days = result.get('debt_days_max', 0)
+    debtor_threshold_key = f"threshold_{admin_settings.get('debtor_threshold', 2)}"
+    debtor_threshold_value = trust_limits.get(debtor_threshold_key, 7000.0)
+
+    if debt > 0.5:
+        if debt_days > admin_settings.get('debtor_days', 90) or debt >= debtor_threshold_value:
+            metki.append('💸')  # Должник
+        else:
+            metki.append('💰')  # Дебиторка
+
+    # 4. Нет заявок
+    days_since_last = result.get('days_since_last')
+    threshold_1 = trust_limits.get('threshold_1', 5000.0)
+
+    if days_since_last is not None:
+        if days_since_last > admin_settings.get('inactive_days', 60) and debt < threshold_1:
+            metki.append('⏰')
+
+    return metki
+
+
+def get_priority_category(result, flags):
+    """
+    Приоритетная категория для круговой диаграммы.
+    """
+    metki = result.get('metki', [])
+    status = result.get('status', 'working')
+
+    if '💀' in metki:
+        return 'blacklist'
+    if '🏆' in metki:
+        return 'golden_fund'
+    if status == 'new':
+        return 'new'
+    if status == 'returned':
+        return 'returned'
+    if status == 'potential':
+        return 'potential'
+    if '💸' in metki:
+        return 'debtor'
+    if '💰' in metki:
+        return 'debitorka'
+    if '⏰' in metki:
+        return 'inactive'
+    if status == 'passive':
+        return 'passive'
+    return 'working'
+
+
+def get_all_companies_summary(df, flags=None, admin_settings=None, trust_limits=None):
+    """
+    Считает метрики для ВСЕХ предприятий.
+    Возвращает dict {company_code: metrics_dict}.
+    """
+    if flags is None:
+        flags = load_company_flags()
+    if admin_settings is None:
+        admin_settings = get_admin_settings()
+    if trust_limits is None:
+        trust_limits = load_trust_limits()
+
+    if df is None or df.empty:
+        return {}
+
+    summary = {}
+
+    # Группируем по company_code
+    grouped = df.groupby('company_code')
+
+    for code, df_company in grouped:
+        code_str = str(code).strip()
+        if not code_str or code_str == 'nan':
+            continue
+
+        company_flags = flags.get(code_str, {})
+
+        metrics = get_company_metrics(
+            company_code=code_str,
+            df_company=df_company,
+            flags=company_flags,
+            admin_settings=admin_settings,
+            trust_limits=trust_limits,
+        )
+        summary[code_str] = metrics
+
+    return summary
+
+
+def get_summary_cached(df, force=False, flags=None, admin_settings=None, trust_limits=None):
+    """
+    Возвращает summary с кэшем (TTL 5 минут).
+    Сбрасывается при save_company_flags / save_trust_limits / save_admin_settings.
+    """
+    global _summary_cache
+    now = datetime.now()
+    
+    if (force or 
+            _summary_cache['data'] is None or 
+            _summary_cache['time'] is None or
+            (now - _summary_cache['time']).total_seconds() > SUMMARY_TTL):
+        _summary_cache['data'] = get_all_companies_summary(
+            df, flags, admin_settings, trust_limits
+        )
+        _summary_cache['time'] = now
+    
+    return _summary_cache['data']
+
+
+CATEGORY_LABELS = {
+    'blacklist': '💀 Чёрный список',
+    'golden_fund': '🏆 Золотой фонд',
+    'new': '🆕 Новое',
+    'returned': '🔄 Вернувшееся',
+    'potential': '🤝 Потенциальное',
+    'debtor': '💸 Должник',
+    'debitorka': '💰 Дебиторка',
+    'inactive': '⏰ Нет заявок',
+    'working': '✅ Рабочее',
+    'passive': '😴 Пассивное',
+}
+
+CATEGORY_ORDER = [
+    'blacklist', 'golden_fund', 'new', 'returned', 'potential',
+    'debtor', 'debitorka', 'inactive', 'working', 'passive',
+]
+
+
+def get_companies_by_category(summary, manager_filter=None):
+    """
+    Группирует предприятия по приоритетной категории.
+    Возвращает dict {category: [list of company_codes]}.
+    """
+    result = {cat: [] for cat in CATEGORY_ORDER}
+
+    for code, metrics in summary.items():
+        # Фильтр по менеджеру
+        if manager_filter and manager_filter != 'Все менеджеры':
+            if metrics.get('manager') != manager_filter:
+                continue
+
+        cat = metrics.get('category', 'working')
+        if cat in result:
+            result[cat].append(code)
+        else:
+            result['working'].append(code)
+
+    return result
+
+
+def get_companies_with_metki_df(summary, manager_filter=None):
+    """
+    Возвращает DataFrame со всеми предприятиями и их метками.
+    """
+    if not summary:
+        return pd.DataFrame()
+
+    rows = []
+    for code, m in summary.items():
+        if manager_filter and manager_filter != 'Все менеджеры':
+            if m.get('manager') != manager_filter:
+                continue
+
+        metki_str = ' '.join(m.get('metki', []))
+        rows.append({
+            'company_code': code,
+            'company_name': m.get('company_name') or '',
+            'oblast': m.get('oblast') or '',
+            'raion': m.get('raion') or '',
+            'manager': m.get('manager') or '',
+            'debt_amount': m.get('debt_amount', 0.0),
+            'debt_days_max': m.get('debt_days_max', 0),
+            'status': m.get('status', ''),
+            'category': m.get('category', ''),
+            'metki': metki_str,
+            'last_invoice_date': m.get('last_invoice_date'),
+            'days_since_last': m.get('days_since_last'),
+        })
+
+    df_res = pd.DataFrame(rows)
+    if not df_res.empty:
+        df_res = df_res.sort_values('debt_amount', ascending=False)
+    return df_res
+
+
+# === ЗАГРУЗКА ВСЕГО ===
 
 
 # === ЗАГРУЗКА ВСЕГО ===

@@ -508,6 +508,32 @@ def main():
         if user_binding:
             st.caption(f"Привязка: {user_binding}")
 
+        # Легенда обозначений
+        try:
+            admin_settings_legend = data_loader.get_admin_settings()
+            trust_limits_legend = data_loader.load_trust_limits()
+            
+            with st.expander("📖 Легенда обозначений", expanded=False):
+                st.markdown(f"""
+**📊 СТАТУСЫ ПРЕДПРИЯТИЙ**
+
+🆕 **Новое** — первое появление, 1 счёт  
+🔄 **Вернувшееся** — перерыв ≥ {admin_settings_legend.get('returned_days', 300)} дней  
+✅ **Рабочее** — есть счета, работаем  
+😴 **Пассивное** — нет счетов > {admin_settings_legend.get('passive_days', 300)} дней  
+🤝 **Потенциальное** — ведём переговоры
+
+**🏷️ МЕТКИ** (могут быть одновременно)
+
+💀 **Чёрный список** — не работаем  
+🏆 **Золотой фонд** — приоритетные  
+⏰ **Нет заявок** — нет счетов > {admin_settings_legend.get('inactive_days', 60)} дней  
+💸 **Должник** — дебиторка > {admin_settings_legend.get('debtor_days', 90)} дней или ≥ порог {admin_settings_legend.get('debtor_threshold', 2)} ({int(trust_limits_legend.get(f"threshold_{admin_settings_legend.get('debtor_threshold', 2)}", 7000))} BYN)  
+💰 **Дебиторка** — есть долг, но < {admin_settings_legend.get('debtor_days', 90)} дней и < порог {admin_settings_legend.get('debtor_threshold', 2)}
+                """)
+        except Exception as e:
+            st.caption(f"⚠️ Легенда недоступна: {e}")
+
         st.divider()
 
         selected_periods = st.multiselect(
@@ -761,16 +787,19 @@ def main():
     # ===== TAB1: ПРЕДПРИЯТИЯ =====
     if 'tab1' in tab_map:
         with tab_map['tab1']:
-            st.subheader("Продажи по предприятиям")
+            # ============================================================
+            # СЕКЦИЯ 1: ПРОДАЖИ ПО ПРЕДПРИЯТИЯМ (как было)
+            # ============================================================
+            st.subheader("📊 Продажи по предприятиям")
             by_company = data_loader.get_sales_by_company(sales_data)
 
             if not by_company.empty:
                 if selected_manager == 'Все менеджеры':
-                    display = by_company[['company', 'raion', 'oblast', 'manager', 'amount']].copy()
-                    display.columns = ['Предприятие', 'Район', 'Область', 'Менеджер', 'Сумма, BYN']
+                    display = by_company[['company_code', 'company', 'raion', 'oblast', 'manager', 'amount']].copy()
+                    display.columns = ['Код', 'Предприятие', 'Район', 'Область', 'Менеджер', 'Сумма, BYN']
                 else:
-                    display = by_company[['company', 'raion', 'oblast', 'amount']].copy()
-                    display.columns = ['Предприятие', 'Район', 'Область', 'Сумма, BYN']
+                    display = by_company[['company_code', 'company', 'raion', 'oblast', 'amount']].copy()
+                    display.columns = ['Код', 'Предприятие', 'Район', 'Область', 'Сумма, BYN']
 
                 display['Сумма, BYN'] = display['Сумма, BYN'].apply(format_int)
 
@@ -796,6 +825,232 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Нет данных")
+
+            st.divider()
+
+            # ============================================================
+            # СЕКЦИЯ 2: КАТЕГОРИИ ПРЕДПРИЯТИЙ (новое)
+            # ============================================================
+            st.subheader("🏷️ Категории предприятий")
+
+            # Загружаем настройки и флаги
+            admin_settings = data_loader.get_admin_settings()
+            trust_limits = data_loader.load_trust_limits()
+
+            # Summary с кэшем
+            summary = data_loader.get_summary_cached(
+                df, 
+                admin_settings=admin_settings,
+                trust_limits=trust_limits
+            )
+
+            # KPI (8 блоков)
+            cat_counts = data_loader.get_companies_by_category(summary, selected_manager)
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.markdown(f'<div class="metric-box-small"><h3>🏢 Всего</h3><p>{len(summary) if selected_manager == "Все менеджеры" else sum(len(v) for v in cat_counts.values())}</p></div>', unsafe_allow_html=True)
+            with k2:
+                st.markdown(f'<div class="metric-box-small"><h3>💀 ЧС</h3><p>{len(cat_counts["blacklist"])}</p></div>', unsafe_allow_html=True)
+            with k3:
+                st.markdown(f'<div class="metric-box-small"><h3>🏆 Золотой фонд</h3><p>{len(cat_counts["golden_fund"])}</p></div>', unsafe_allow_html=True)
+            with k4:
+                st.markdown(f'<div class="metric-box-small"><h3>🆕 Новые</h3><p>{len(cat_counts["new"])}</p></div>', unsafe_allow_html=True)
+
+            k5, k6, k7, k8 = st.columns(4)
+            with k5:
+                st.markdown(f'<div class="metric-box-small"><h3>🔄 Вернувшиеся</h3><p>{len(cat_counts["returned"])}</p></div>', unsafe_allow_html=True)
+            with k6:
+                st.markdown(f'<div class="metric-box-small"><h3>🤝 Потенциальные</h3><p>{len(cat_counts["potential"])}</p></div>', unsafe_allow_html=True)
+            with k7:
+                st.markdown(f'<div class="metric-box-small"><h3>💸 Должники</h3><p>{len(cat_counts["debtor"])}</p></div>', unsafe_allow_html=True)
+            with k8:
+                st.markdown(f'<div class="metric-box-small"><h3>⏰ Нет заявок</h3><p>{len(cat_counts["inactive"])}</p></div>', unsafe_allow_html=True)
+
+            st.divider()
+
+            # Графики (круговая + столбчатая)
+            chart_col1, chart_col2 = st.columns(2)
+
+            with chart_col1:
+                st.markdown("**Распределение по категориям**")
+                pie_data = []
+                for cat in data_loader.CATEGORY_ORDER:
+                    cnt = len(cat_counts.get(cat, []))
+                    if cnt > 0:
+                        pie_data.append({'category': data_loader.CATEGORY_LABELS[cat], 'count': cnt})
+
+                if pie_data:
+                    pie_df = pd.DataFrame(pie_data)
+                    fig = px.pie(
+                        pie_df, values='count', names='category',
+                        color_discrete_sequence=CONTRAST_PALETTE
+                    )
+                    fig.update_traces(
+                        hovertemplate='<b>%{label}</b><br>%{value} шт. (%{percent})<extra></extra>'
+                    )
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Нет данных")
+
+            with chart_col2:
+                st.markdown("**Превышение лимита доверия**")
+                t1 = trust_limits.get('threshold_1', 5000)
+                t2 = trust_limits.get('threshold_2', 7000)
+                t3 = trust_limits.get('threshold_3', 10000)
+
+                over_t1 = 0
+                over_t2 = 0
+                over_t3 = 0
+
+                for code, m in summary.items():
+                    if selected_manager != 'Все менеджеры' and m.get('manager') != selected_manager:
+                        continue
+                    debt = m.get('debt_amount', 0)
+                    if debt >= t3:
+                        over_t3 += 1
+                    elif debt >= t2:
+                        over_t2 += 1
+                    elif debt >= t1:
+                        over_t1 += 1
+
+                bar_df = pd.DataFrame({
+                    'Порог': [f'≥ {int(t1)}', f'≥ {int(t2)}', f'≥ {int(t3)}'],
+                    'Кол-во': [over_t1, over_t2, over_t3]
+                })
+                fig = px.bar(
+                    bar_df, x='Порог', y='Кол-во',
+                    color='Порог',
+                    color_discrete_sequence=['#F4D03F', '#F5B041', '#EC7063']
+                )
+                fig.update_traces(
+                    hovertemplate='<b>%{x} BYN</b><br>%{y} предприятий<extra></extra>'
+                )
+                fig.update_layout(showlegend=False, height=400)
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.divider()
+
+            # Таблица предприятий с метками
+            st.markdown("**Все предприятия**")
+            df_companies = data_loader.get_companies_with_metki_df(summary, selected_manager)
+
+            if not df_companies.empty:
+                display = df_companies.copy()
+                display['debt_amount'] = display['debt_amount'].apply(format_int)
+
+                status_map = {
+                    'new': '🆕 Новое',
+                    'returned': '🔄 Вернувшееся',
+                    'working': '✅ Рабочее',
+                    'passive': '😴 Пассивное',
+                    'potential': '🤝 Потенциальное',
+                }
+                display['status_display'] = display['status'].map(status_map).fillna(display['status'])
+
+                display = display[['company_code', 'company_name', 'oblast', 'raion', 'manager',
+                                    'debt_amount', 'status_display', 'metki']]
+                display.columns = ['Код', 'Название', 'Область', 'Район', 'Менеджер',
+                                    'Дебиторка, BYN', 'Статус', 'Метки']
+
+                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.caption(f"Всего: {len(df_companies)} предприятий")
+            else:
+                st.info("Нет данных")
+
+            st.divider()
+
+            # Списки по категориям
+            st.markdown("**Списки по категориям**")
+
+            # Считаем предприятия с превышением порогов
+            over_limit_codes = []
+            for code, m in summary.items():
+                if selected_manager != 'Все менеджеры' and m.get('manager') != selected_manager:
+                    continue
+                debt = m.get('debt_amount', 0)
+                if debt >= trust_limits.get('threshold_1', 5000):
+                    over_limit_codes.append(code)
+            over_limit_codes.sort(
+                key=lambda c: summary[c].get('debt_amount', 0),
+                reverse=True
+            )
+
+            list_tabs = st.tabs([
+                f"💀 ЧС ({len(cat_counts['blacklist'])})",
+                f"🏆 Золото ({len(cat_counts['golden_fund'])})",
+                f"🆕 Новые ({len(cat_counts['new'])})",
+                f"🔄 Вернувшиеся ({len(cat_counts['returned'])})",
+                f"🤝 Потенциальные ({len(cat_counts['potential'])})",
+                f"💸 Должники ({len(cat_counts['debtor'])})",
+                f"💰 Дебиторка ({len(cat_counts['debitorka'])})",
+                f"⏰ Нет заявок ({len(cat_counts['inactive'])})",
+                f"⚠️ Превышение лимита ({len(over_limit_codes)})",
+            ])
+
+            list_categories = ['blacklist', 'golden_fund', 'new', 'returned',
+                                'potential', 'debtor', 'debitorka', 'inactive']
+
+            # Существующие 8 табов
+            for i, cat in enumerate(list_categories):
+                with list_tabs[i]:
+                    codes = cat_counts.get(cat, [])
+                    if not codes:
+                        st.info("Пусто")
+                        continue
+
+                    rows = []
+                    for code in codes:
+                        m = summary.get(code, {})
+                        rows.append({
+                            'Код': code,
+                            'Название': m.get('company_name', ''),
+                            'Менеджер': m.get('manager', ''),
+                            'Район': m.get('raion', ''),
+                            'Дебиторка': format_int(m.get('debt_amount', 0)),
+                            'Дней долга': m.get('debt_days_max', 0),
+                            'Метки': ' '.join(m.get('metki', [])),
+                        })
+
+                    df_list = pd.DataFrame(rows)
+                    st.dataframe(df_list, use_container_width=True, hide_index=True)
+                    st.caption(f"Всего: {len(df_list)} предприятий")
+
+            # 9-й таб — Превышение лимита
+            with list_tabs[8]:
+                if not over_limit_codes:
+                    st.info("Нет предприятий с превышением лимита")
+                else:
+                    t1 = trust_limits.get('threshold_1', 5000)
+                    t2 = trust_limits.get('threshold_2', 7000)
+                    t3 = trust_limits.get('threshold_3', 10000)
+
+                    rows = []
+                    for code in over_limit_codes:
+                        m = summary.get(code, {})
+                        debt = m.get('debt_amount', 0)
+
+                        if debt >= t3:
+                            over_display = f'⚠️⚠️⚠️ ≥ {int(t3)}'
+                        elif debt >= t2:
+                            over_display = f'⚠️⚠️ ≥ {int(t2)}'
+                        else:
+                            over_display = f'⚠️ ≥ {int(t1)}'
+
+                        rows.append({
+                            'Код': code,
+                            'Название': m.get('company_name', ''),
+                            'Менеджер': m.get('manager', ''),
+                            'Район': m.get('raion', ''),
+                            'Дебиторка': format_int(debt),
+                            'Дней долга': m.get('debt_days_max', 0),
+                            'Превышение': over_display,
+                        })
+
+                    df_list = pd.DataFrame(rows)
+                    st.dataframe(df_list, use_container_width=True, hide_index=True)
+                    st.caption(f"Всего: {len(df_list)} предприятий с превышением лимита")
 
     # ===== TAB2: РАЙОНЫ =====
     if 'tab2' in tab_map:
