@@ -85,6 +85,9 @@ DEFAULT_ADMIN_SETTINGS = {
     'inactive_days': 60,
     'debtor_days': 90,
     'debtor_threshold': 2,
+    'debtor_days': 90,
+    'debtor_threshold': 2,
+    'prepayment_active_days': 30,
 }
 
 DEFAULT_TRUST_LIMITS = {
@@ -1563,12 +1566,14 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         'invoices_count': 0,
         'first_invoice_date': None,
         'last_invoice_date': None,
+        'last_activity_date': None,
         'days_since_last': None,
         'debt_amount': 0.0,
         'debt_days_max': 0,
         'status': 'working',
         'metki': [],
         'category': 'working',
+        'has_prepayment': False,
     }
 
     # Если нет счетов — «Пассивное» (или ручное «Потенциальное»)
@@ -1588,10 +1593,19 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     result['oblast'] = first_row.get('oblast')
     result['raion'] = first_row.get('raion')
 
-    # Менеджер — из ПОСЛЕДНЕГО счёта (самый свежий)
-    sales_sorted = sales.sort_values('invoice_date', ascending=False)
-    last_row = sales_sorted.iloc[0]
-    result['manager'] = last_row.get('manager')
+    # Менеджер — из ПОСЛЕДНЕЙ записи (счёт ИЛИ предсчёт)
+    all_entries = df_company[
+        (df_company['row_type'] == 'sale') &
+        (df_company['invoice_date'].notna())
+    ].copy()
+    if not all_entries.empty:
+        all_entries_sorted = all_entries.sort_values('invoice_date', ascending=False)
+        last_entry = all_entries_sorted.iloc[0]
+        result['manager'] = last_entry.get('manager')
+        result['last_activity_date'] = last_entry.get('invoice_date')
+    else:
+        result['manager'] = first_row.get('manager')
+        result['last_activity_date'] = None
 
     invoice_dates = sales['invoice_date'].dropna().sort_values()
     if len(invoice_dates) > 0:
@@ -1625,6 +1639,19 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
             lambda d: (today - d).days if pd.notna(d) else 0
         )
         result['debt_days_max'] = int(unpaid['days'].max())
+
+    # === ПРЕДСЧЁТ ===
+    prepayments = df_company[
+        (df_company['row_type'] == 'sale') &
+        (df_company['order_type'] == 1) &
+        (df_company['invoice_date'].notna())
+    ]
+    if not prepayments.empty:
+        last_prepayment_date = prepayments['invoice_date'].max()
+        days_since_prepayment = (today - last_prepayment_date).days
+        active_days = admin_settings.get('prepayment_active_days', 30)
+        if days_since_prepayment <= active_days:
+            result['has_prepayment'] = True
 
     # === СТАТУС ===
     result['status'] = calculate_company_status(
@@ -1720,12 +1747,12 @@ def calculate_company_metki(result, flags, admin_settings, trust_limits):
         else:
             metki.append('💰')  # Дебиторка
 
-    # 4. Нет заявок
+    # 4. Нет заявок — только если НЕТ дебиторки вообще
     days_since_last = result.get('days_since_last')
-    threshold_1 = trust_limits.get('threshold_1', 5000.0)
 
     if days_since_last is not None:
-        if days_since_last > admin_settings.get('inactive_days', 60) and debt < threshold_1:
+        # ⏰ ставим только если дебиторка = 0 (нет долга)
+        if days_since_last > admin_settings.get('inactive_days', 60) and debt < 0.5:
             metki.append('⏰')
 
     return metki
@@ -1872,7 +1899,19 @@ def get_companies_with_metki_df(summary, manager_filter=None):
             if m.get('manager') != manager_filter:
                 continue
 
-        metki_str = ' '.join(m.get('metki', []))
+        # Расшифровка меток
+        METKI_LABELS = {
+            '💀': '💀 ЧС',
+            '🏆': '🏆 Золото',
+            '🆕': '🆕 Новое',
+            '🔄': '🔄 Вернувшееся',
+            '🤝': '🤝 Потенциальное',
+            '💸': '💸 Должник',
+            '💰': '💰 Дебиторка',
+            '⏰': '⏰ Нет заявок',
+        }
+        metki_raw = m.get('metki', [])
+        metki_str = ' • '.join(METKI_LABELS.get(emoji, emoji) for emoji in metki_raw)
         rows.append({
             'company_code': code,
             'company_name': m.get('company_name') or '',

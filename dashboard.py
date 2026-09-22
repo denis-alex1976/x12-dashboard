@@ -14,6 +14,9 @@ st.set_page_config(
     layout="wide"
 )
 
+# Запрет Google Переводчик переводить страницу
+st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
+
 st.markdown("""
 <style>
     .main-header { font-size: 1.5rem; font-weight: bold; color: #1f77b4; margin-bottom: 0.3rem; }
@@ -25,10 +28,12 @@ st.markdown("""
     .metric-box-small h3 { margin: 0; font-size: 0.8rem; color: #666; }
     .metric-box-small p { margin: 0.2rem 0 0 0; font-size: 1.4rem; font-weight: bold; color: #1f77b4; }
 
+    /* Скрываем кнопки экспорта и toolbar у таблиц */
     button[title="Download as CSV"] { display: none !important; }
     [data-testid="stElementToolbar"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
+
 
 
 MONTHS_RU = {
@@ -529,7 +534,7 @@ def main():
 🏆 **Золотой фонд** — приоритетные  
 ⏰ **Нет заявок** — нет счетов > {admin_settings_legend.get('inactive_days', 60)} дней  
 💸 **Должник** — дебиторка > {admin_settings_legend.get('debtor_days', 90)} дней или ≥ порог {admin_settings_legend.get('debtor_threshold', 2)} ({int(trust_limits_legend.get(f"threshold_{admin_settings_legend.get('debtor_threshold', 2)}", 7000))} BYN)  
-💰 **Дебиторка** — есть долг, но < {admin_settings_legend.get('debtor_days', 90)} дней и < порог {admin_settings_legend.get('debtor_threshold', 2)}
+💰 **Дебиторка** — есть долг, но < {admin_settings_legend.get('debtor_days', 90)} дней и < порог {admin_settings_legend.get('debtor_threshold', 2)} ({int(trust_limits_legend.get(f"threshold_{admin_settings_legend.get('debtor_threshold', 2)}", 7000))} BYN)
                 """)
         except Exception as e:
             st.caption(f"⚠️ Легенда недоступна: {e}")
@@ -679,7 +684,7 @@ def main():
         plot_bgcolor='#fafafa',
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
     # ===== СРАВНЕНИЕ ГОД К ГОДУ =====
     st.subheader("📊 Сравнение год к году")
@@ -708,7 +713,7 @@ def main():
             yaxis=dict(automargin=True, tickformat=',.0f'),
             margin=dict(l=140, r=20)
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False})
     else:
         st.info("Недостаточно данных для сравнения (нужно 2+ года)")
 
@@ -822,7 +827,7 @@ def main():
                     coloraxis_showscale=False,
                     height=500
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет данных")
 
@@ -890,7 +895,7 @@ def main():
                         hovertemplate='<b>%{label}</b><br>%{value} шт. (%{percent})<extra></extra>'
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 else:
                     st.info("Нет данных")
 
@@ -928,7 +933,7 @@ def main():
                     hovertemplate='<b>%{x} BYN</b><br>%{y} предприятий<extra></extra>'
                 )
                 fig.update_layout(showlegend=False, height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
             st.divider()
 
@@ -1009,8 +1014,9 @@ def main():
                             'Менеджер': m.get('manager', ''),
                             'Район': m.get('raion', ''),
                             'Дебиторка': format_int(m.get('debt_amount', 0)),
-                            'Дней долга': m.get('debt_days_max', 0),
-                            'Метки': ' '.join(m.get('metki', [])),
+                            'Дней без заявок': m.get('days_since_last') if m.get('days_since_last') is not None else '—',
+                            'Предсчёт': '✅' if m.get('has_prepayment') else '❌',
+                            'Метки': ' • '.join({'💀': '💀 ЧС', '🏆': '🏆 Золото', '🆕': '🆕 Новое', '🔄': '🔄 Вернувшееся', '🤝': '🤝 Потенциальное', '💸': '💸 Должник', '💰': '💰 Дебиторка', '⏰': '⏰ Нет заявок'}.get(e, e) for e in m.get('metki', [])),
                         })
 
                     df_list = pd.DataFrame(rows)
@@ -1089,7 +1095,7 @@ def main():
                         margin=dict(l=200, r=20),
                         height=500
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 with col2:
                     pie_data = by_raion.head(10).copy()
                     pie_data['amount_str'] = pie_data['amount'].apply(format_int)
@@ -1102,7 +1108,7 @@ def main():
                         hovertemplate='<b>%{label}</b><br>%{customdata[0]} BYN<br>%{percent}<extra></extra>'
                     )
                     fig.update_layout(height=500)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет данных")
 
@@ -1143,7 +1149,7 @@ def main():
                         margin=dict(l=200, r=20),
                         height=400
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 with col2:
                     pie_data = by_oblast.copy()
                     pie_data['amount_str'] = pie_data['amount'].apply(format_int)
@@ -1156,7 +1162,7 @@ def main():
                         hovertemplate='<b>%{label}</b><br>%{customdata[0]} BYN<br>%{percent}<extra></extra>'
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет данных")
 
@@ -1197,7 +1203,7 @@ def main():
                         margin=dict(l=280, r=20),
                         height=500
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 with col2:
                     pie_data = by_research.copy()
                     pie_data['amount_str'] = pie_data['amount'].apply(format_int)
@@ -1210,7 +1216,7 @@ def main():
                         hovertemplate='<b>%{label}</b><br>%{customdata[0]} BYN<br>%{percent}<extra></extra>'
                     )
                     fig.update_layout(height=500)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
                 st.subheader("📈 Динамика исследований по месяцам")
                 df_res = df[(df['row_type'] == 'sale') & (df['order_type'] == 0)].copy()
@@ -1234,7 +1240,7 @@ def main():
                     yaxis=dict(automargin=True, tickformat=',.0f'),
                     margin=dict(l=140, r=20)
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет данных")
 
@@ -1288,7 +1294,7 @@ def main():
                         yaxis=dict(automargin=True, tickformat=',.0f'),
                         margin=dict(l=140, r=20)
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 with col2:
                     structure_pie = structure.copy()
                     fig = px.pie(
@@ -1300,7 +1306,7 @@ def main():
                         hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>',
                         sort=False
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
                 summary_display = structure.copy()
                 summary_display['amount'] = summary_display['amount'].apply(format_int)
@@ -1338,7 +1344,7 @@ def main():
                             hovertemplate='<b>%{label}</b><br>%{customdata} BYN<br>%{percent}<extra></extra>',
                             customdata=[format_int(v) for v in debt_positive['debt']]
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                 st.divider()
 
             st.subheader("🏢 Предприятия с дебиторкой")
@@ -1375,7 +1381,7 @@ def main():
                     coloraxis_showscale=False,
                     height=500
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет предприятий с дебиторкой за выбранный период")
 
@@ -1440,7 +1446,7 @@ def main():
                         yaxis=dict(automargin=True, tickformat=',.0f'),
                         margin=dict(l=140, r=20)
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
                 with col2:
                     struct_sorted = payments_structure.copy()
@@ -1462,7 +1468,7 @@ def main():
                         textinfo='label+percent',
                     )])
                     fig.update_layout(height=400, showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
                 display = payments_structure.copy()
                 display['amount'] = display['amount'].apply(format_int)
@@ -1496,7 +1502,7 @@ def main():
                 fig.update_traces(
                     hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>'
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
             else:
                 st.info("Нет данных")
 
