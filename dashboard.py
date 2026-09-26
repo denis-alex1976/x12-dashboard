@@ -69,6 +69,7 @@ USER_TABS = [
     ('tab4', "🔬 Исследования"),
     ('tab5', "💰 Дебиторка"),
     ('tab6', "💵 Оплаты"),
+    ('tab7', "📋 Предсчета"),
 ]
 
 ADMIN_TABS = [
@@ -475,9 +476,540 @@ def render_access_tab():
         st.error(f"Ошибка чтения журнала: {e}")
 
 
+    # === РАЗРЕШЕНИЯ ДЛЯ АДМИНОВ (только суперадмин) ===
+    if st.session_state.role == 'super_admin':
+        st.divider()
+
+        with st.expander("🔐 Разрешения для админов", expanded=False):
+            st.caption("Управление правами администраторов. "
+                       "Если опция выключена — соответствующий блок скрыт от админов.")
+
+            admin_settings = data_loader.get_admin_settings()
+
+            # Права на метки
+            st.markdown("**🏷️ Метки предприятий**")
+            c1, c2 = st.columns(2)
+            with c1:
+                new_allow_blacklist = st.checkbox(
+                    "💀 ЧС — админы могут ставить/снимать",
+                    value=admin_settings.get('allow_admins_blacklist', True),
+                    key="res_allow_blacklist"
+                )
+            with c2:
+                new_allow_golden = st.checkbox(
+                    "🏆 Золото — админы могут ставить/снимать",
+                    value=admin_settings.get('allow_admins_golden', True),
+                    key="res_allow_golden"
+                )
+
+            st.divider()
+
+            # Права на сроки и пороги
+            st.markdown("**⚙️ Настройки**")
+            c3, c4 = st.columns(2)
+            with c3:
+                new_allow_trust = st.checkbox(
+                    "💰 Пороги TrustLimits + Дебиторка",
+                    value=admin_settings.get('allow_admins_trust_limits', True),
+                    key="res_allow_trust"
+                )
+                new_allow_status = st.checkbox(
+                    "🔄 Сроки статусов + Предсчёт",
+                    value=admin_settings.get('allow_admins_status_days', True),
+                    key="res_allow_status"
+                )
+            with c4:
+                new_allow_inactive = st.checkbox(
+                    "⏰ Срок метки «Нет заявок»",
+                    value=admin_settings.get('allow_admins_inactive_days', True),
+                    key="res_allow_inactive"
+                )
+                new_allow_potential = st.checkbox(
+                    "🤝 Срок метки «Потенциальное»",
+                    value=admin_settings.get('allow_admins_potential_days', True),
+                    key="res_allow_potential"
+                )
+
+            st.divider()
+
+            # Видимость
+            st.markdown("**👁️ Видимость**")
+            new_show_trust = st.checkbox(
+                "⚠️ Показывать «Превышение лимита доверия» всем",
+                value=admin_settings.get('show_trust_limits', True),
+                key="res_show_trust"
+            )
+
+            if st.button("💾 Сохранить разрешения", key="save_resolutions", type="primary"):
+                new_settings = dict(admin_settings)
+                new_settings['allow_admins_blacklist'] = new_allow_blacklist
+                new_settings['allow_admins_golden'] = new_allow_golden
+                new_settings['allow_admins_trust_limits'] = new_allow_trust
+                new_settings['allow_admins_status_days'] = new_allow_status
+                new_settings['allow_admins_inactive_days'] = new_allow_inactive
+                new_settings['allow_admins_potential_days'] = new_allow_potential
+                new_settings['show_trust_limits'] = new_show_trust
+
+                if data_loader.save_admin_settings(new_settings):
+                    st.success("✅ Разрешения сохранены")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("❌ Не удалось сохранить")
+
+
 # ============================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================
+
+@st.fragment
+def render_potential_manager(summary, admin_settings, selected_manager):
+    """Expander управления статусом «Потенциальный» через data_editor."""
+    with st.expander("🎯 Управление статусом «Потенциальный»", expanded=False):
+        st.caption("Статус «Потенциальный» — для предприятий, с которыми ведём переговоры. "
+                   "Доступен менеджерам для своих предприятий, админам — для всех.")
+
+        current_user = st.session_state.username
+        current_role = st.session_state.role
+        user_binding = st.session_state.manager_binding
+
+        can_manage = current_role in ('super_admin', 'admin') or (current_role == 'manager' and user_binding)
+
+        if not can_manage:
+            st.info("Управление статусом доступно менеджерам (для своих предприятий) и админам.")
+            return
+
+        if current_role in ('admin', 'super_admin'):
+            selected_filter_manager = selected_manager
+        else:
+            selected_filter_manager = user_binding
+
+        flags = data_loader.load_company_flags() or {}
+
+        rows = []
+        for code, m in summary.items():
+            if selected_filter_manager != 'Все менеджеры':
+                if m.get('manager') != selected_filter_manager:
+                    continue
+
+            flag = flags.get(code, {})
+            if flag.get('blacklist'):
+                continue
+
+            is_potential = flag.get('status') == 'potential'
+            status_date = flag.get('status_date', '')
+            days_in_status = data_loader.get_potential_days(status_date) if is_potential else 0
+
+            rows.append({
+                'code': code,
+                'name': m.get('company_name', ''),
+                'manager': m.get('manager', ''),
+                'is_potential': is_potential,
+                'days': days_in_status,
+            })
+
+        if not rows:
+            st.info("Нет предприятий для управления.")
+            return
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values('code')
+
+        warning_days = admin_settings.get('potential_warning_days', 90)
+
+        # Формируем отображаемый DataFrame
+        display = pd.DataFrame({
+            'Код': df['code'],
+            'Название': df['name'],
+            'Менеджер': df['manager'],
+            'Статус': df.apply(
+                lambda r: f"🤝 {r['days']} дн." + (" ⚠️" if r['days'] > warning_days else "")
+                if r['is_potential'] else "⬜ —",
+                axis=1
+            ),
+            'Потенциальный': df['is_potential'],
+        })
+
+        st.caption(f"Всего: {len(display)} предприятий. "
+                   f"Отметьте 🤝 напротив нужных и нажмите «Применить».")
+
+        edited = st.data_editor(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['Код', 'Название', 'Менеджер', 'Статус'],
+            column_config={
+                'Потенциальный': st.column_config.CheckboxColumn(
+                    "Поставить 🤝",
+                    help="Отметьте, чтобы поставить статус «Потенциальный»",
+                    default=False,
+                ),
+            },
+            key="potential_editor",
+        )
+
+        if st.button("💾 Применить изменения", key="apply_potential_changes", type="primary"):
+            changed = 0
+            errors = []
+
+            for i, row in edited.iterrows():
+                original = display.iloc[i]['Потенциальный']
+                new_val = row['Потенциальный']
+
+                if original == new_val:
+                    continue
+
+                code = row['Код']
+
+                try:
+                    if new_val:
+                        data_loader.set_company_potential(
+                            code,
+                            manager_binding=selected_filter_manager,
+                            added_by=current_user
+                        )
+                        changed += 1
+                    else:
+                        data_loader.remove_company_potential(code)
+                        changed += 1
+                except Exception as e:
+                    errors.append(f"{code}: {e}")
+
+            st.cache_data.clear()
+
+            if changed:
+                st.session_state['pot_msg'] = f"✅ Изменено: {changed}"
+            if errors:
+                st.session_state['pot_err'] = f"❌ Ошибки: {'; '.join(errors)}"
+
+            st.rerun()
+
+
+@st.fragment
+def render_metki_editor(summary, selected_manager, can_edit_blacklist, can_edit_golden):
+    """Блок редактирования меток предприятий (💀, 🏆) через selectbox + radio."""
+    st.markdown("**🏷️ Метки предприятий**")
+
+    primary_map = data_loader.get_primary_manager_by_raion(summary)
+    flags = data_loader.load_company_flags() or {}
+
+    # Поиск
+    query = st.text_input(
+        "🔍 Поиск по коду или названию",
+        key="admin_settings_search",
+        placeholder="Например: Кухчицы или 146"
+    )
+
+    # Формируем список предприятий (с фильтрами)
+    filtered = []
+    for code, m in summary.items():
+        primary = primary_map.get(code, '—')
+        managers_set = m.get('managers_set', set())
+
+        # Фильтр по менеджеру (из сайдбара)
+        if selected_manager != 'Все менеджеры':
+            if selected_manager != primary and selected_manager not in managers_set:
+                continue
+
+        # Фильтр по поиску
+        if query:
+            q = query.lower()
+            name = (m.get('company_name') or '').lower()
+            if q not in code.lower() and q not in name:
+                continue
+
+        mgr_display = data_loader.format_managers_display(primary, managers_set)
+
+        filtered.append({
+            'code': code,
+            'name': m.get('company_name') or '',
+            'raion': m.get('raion') or '',
+            'manager': mgr_display,
+        })
+
+    if not filtered:
+        st.info("Нет предприятий для отображения (проверь фильтры)")
+        return
+
+    st.caption(f"Всего: {len(filtered)} предприятий")
+
+    # Selectbox с предприятием
+    options = [f"{r['code']} — {r['name']}" for r in filtered]
+    selected_display = st.selectbox(
+        "Выбери предприятие",
+        options,
+        key="admin_settings_company"
+    )
+
+    # Извлекаем код
+    selected_code = selected_display.split(' — ')[0].strip()
+
+    # Находим запись
+    selected = next((r for r in filtered if r['code'] == selected_code), None)
+    if not selected:
+        return
+
+    # Информация о предприятии
+    st.markdown(f"**Район:** {selected['raion']}")
+    st.markdown(f"**Менеджер:** {selected['manager']}")
+
+    # Текущие метки
+    flag = flags.get(selected_code, {})
+    current_blacklist = flag.get('blacklist', False)
+    current_golden = flag.get('golden_fund', False)
+
+    # Радио: взаимоисключение
+    if current_blacklist:
+        default_idx = 1  # ЧС
+    elif current_golden:
+        default_idx = 2  # Золото
+    else:
+        default_idx = 0  # Нет
+
+    metka = st.radio(
+        "Метка",
+        options=['—', '💀 ЧС', '🏆 Золото'],
+        index=default_idx,
+        key=f"admin_settings_metka_{selected_code}",
+        horizontal=True,
+    )
+
+    st.caption("Выбери метку и нажми «💾 Сохранить метку».")
+
+    if st.button("💾 Сохранить метку", key=f"save_metka_{selected_code}", type="primary"):
+        flags_to_save = data_loader.load_company_flags() or {}
+        if selected_code not in flags_to_save:
+            flags_to_save[selected_code] = {
+                'company_name': selected['name'],
+                'date_added': datetime.now().strftime('%Y-%m-%d'),
+                'added_by': st.session_state.username,
+            }
+
+        if metka == '💀 ЧС':
+            flags_to_save[selected_code]['blacklist'] = True
+            flags_to_save[selected_code]['golden_fund'] = False
+        elif metka == '🏆 Золото':
+            flags_to_save[selected_code]['blacklist'] = False
+            flags_to_save[selected_code]['golden_fund'] = True
+        else:
+            flags_to_save[selected_code]['blacklist'] = False
+            flags_to_save[selected_code]['golden_fund'] = False
+
+        if data_loader.save_company_flags(flags_to_save):
+            st.success(f"✅ Метка сохранена: {selected_code} — {metka}")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.error("❌ Не удалось сохранить метку")
+
+
+def render_admin_settings(summary, selected_manager):
+    """Expander управления метками, лимитами и сроками."""
+    user_role = st.session_state.role
+    
+    # Только админ и суперадмин
+    if user_role not in ('admin', 'super_admin'):
+        return
+    
+    admin_settings = data_loader.get_admin_settings()
+    trust_limits = data_loader.load_trust_limits()
+    
+    is_super = (user_role == 'super_admin')
+    
+    # Разрешения
+    can_edit_blacklist = is_super or admin_settings.get('allow_admins_blacklist', False)
+    can_edit_golden = is_super or admin_settings.get('allow_admins_golden', False)
+    can_edit_trust = is_super or admin_settings.get('allow_admins_trust_limits', False)
+    can_edit_status_days = is_super or admin_settings.get('allow_admins_status_days', False)
+    can_edit_inactive = is_super or admin_settings.get('allow_admins_inactive_days', False)
+    can_edit_potential = is_super or admin_settings.get('allow_admins_potential_days', False)
+    
+    # Если ни одно разрешение не дано — ничего не показываем
+    if not any([can_edit_blacklist, can_edit_golden, can_edit_trust,
+                can_edit_status_days, can_edit_inactive, can_edit_potential]):
+        return
+    
+    with st.expander("⚙️ Управление метками и лимитами", expanded=False):
+        
+        # ============================================================
+        # БЛОК 1: МЕТКИ ПРЕДПРИЯТИЙ (💀, 🏆)
+        # ============================================================
+        if can_edit_blacklist or can_edit_golden:
+            render_metki_editor(summary, selected_manager, can_edit_blacklist, can_edit_golden)
+            st.divider()
+        
+        # ============================================================
+        # БЛОК 2: ПОРОГИ TRUST LIMITS
+        # ============================================================
+        if can_edit_trust:
+            st.markdown("**💰 Пороги лимита доверия**")
+            tc1, tc2, tc3 = st.columns(3)
+            with tc1:
+                new_t1 = st.number_input(
+                    "Порог 1, BYN",
+                    value=float(trust_limits.get('threshold_1', 5000)),
+                    step=500.0, format="%.0f",
+                    key="admin_settings_t1"
+                )
+            with tc2:
+                new_t2 = st.number_input(
+                    "Порог 2, BYN",
+                    value=float(trust_limits.get('threshold_2', 7000)),
+                    step=500.0, format="%.0f",
+                    key="admin_settings_t2"
+                )
+            with tc3:
+                new_t3 = st.number_input(
+                    "Порог 3, BYN",
+                    value=float(trust_limits.get('threshold_3', 10000)),
+                    step=500.0, format="%.0f",
+                    key="admin_settings_t3"
+                )
+            st.divider()
+        
+        # ============================================================
+        # БЛОК 3: СРОКИ СТАТУСОВ
+        # ============================================================
+        if can_edit_status_days:
+            st.markdown("**🔄 Сроки статусов**")
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1:
+                new_working = st.number_input(
+                    "Актив ≤ дней",
+                    value=int(admin_settings.get('working_days', 60)),
+                    min_value=1, step=1,
+                    key="admin_settings_working"
+                )
+            with sc2:
+                new_passive = st.number_input(
+                    "Пассив ≤ дней",
+                    value=int(admin_settings.get('passive_days', 90)),
+                    min_value=1, step=1,
+                    key="admin_settings_passive"
+                )
+            with sc3:
+                new_lost = st.number_input(
+                    "Потери > дней",
+                    value=int(admin_settings.get('lost_days', 120)),
+                    min_value=1, step=1,
+                    key="admin_settings_lost"
+                )
+            with sc4:
+                new_returned = st.number_input(
+                    "Камбэк разрыв > дней",
+                    value=int(admin_settings.get('returned_days', 120)),
+                    min_value=1, step=1,
+                    key="admin_settings_returned"
+                )
+            st.divider()
+        
+        # ============================================================
+        # БЛОК 4: СРОКИ МЕТОК
+        # ============================================================
+        if can_edit_inactive or can_edit_potential:
+            st.markdown("**🏷️ Сроки меток**")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                new_inactive = st.number_input(
+                    "⏰ Нет заявок > дней",
+                    value=int(admin_settings.get('inactive_days', 30)),
+                    min_value=1, step=1,
+                    key="admin_settings_inactive",
+                    disabled=not can_edit_inactive
+                )
+            with mc2:
+                new_potential = st.number_input(
+                    "🤝 Предупреждение, дней",
+                    value=int(admin_settings.get('potential_warning_days', 90)),
+                    min_value=1, step=1,
+                    key="admin_settings_potential",
+                    disabled=not can_edit_potential
+                )
+            st.divider()
+        
+        # ============================================================
+        # БЛОК 5: ДЕБИТОРКА
+        # ============================================================
+        if can_edit_trust:
+            st.markdown("**💰 Дебиторка**")
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                new_debtor_days = st.number_input(
+                    "💸 Должник > дней",
+                    value=int(admin_settings.get('debtor_days', 90)),
+                    min_value=1, step=1,
+                    key="admin_settings_debtor_days"
+                )
+            with dc2:
+                new_debtor_thr = st.selectbox(
+                    "Превышение какого порога лимита доверия = Должник",
+                    options=[1, 2, 3],
+                    index=int(admin_settings.get('debtor_threshold', 2)) - 1,
+                    key="admin_settings_debtor_thr"
+                )
+            st.divider()
+        
+        # ============================================================
+        # БЛОК 6: ПРЕДСЧЁТ
+        # ============================================================
+        if can_edit_status_days:
+            st.markdown("**📋 Предсчёт**")
+            new_prepayment = st.number_input(
+                "Активен ≤ дней",
+                value=int(admin_settings.get('prepayment_active_days', 30)),
+                min_value=1, step=1,
+                key="admin_settings_prepayment"
+            )
+        
+        # ============================================================
+        # КНОПКА СОХРАНИТЬ
+        # ============================================================
+        if st.button("💾 Сохранить всё", key="admin_settings_save", type="primary"):
+            errors = []
+            
+            # 1. Проверка TrustLimits
+            if can_edit_trust:
+                if not (new_t1 < new_t2 < new_t3):
+                    errors.append("❌ Пороги должны возрастать: t1 < t2 < t3")
+            
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                # 2. Метки предприятий сохраняются отдельной кнопкой внутри блока
+                #    (здесь ничего не делаем)
+                pass
+                
+                # 3. Сохраняем TrustLimits
+                if can_edit_trust:
+                    data_loader.save_trust_limits({
+                        'threshold_1': new_t1,
+                        'threshold_2': new_t2,
+                        'threshold_3': new_t3,
+                    })
+                
+                # 4. Сохраняем admin_settings
+                new_settings = dict(admin_settings)
+                if can_edit_status_days:
+                    new_settings['working_days'] = new_working
+                    new_settings['passive_days'] = new_passive
+                    new_settings['lost_days'] = new_lost
+                    new_settings['returned_days'] = new_returned
+                    new_settings['prepayment_active_days'] = new_prepayment
+                if can_edit_inactive:
+                    new_settings['inactive_days'] = new_inactive
+                if can_edit_potential:
+                    new_settings['potential_warning_days'] = new_potential
+                if can_edit_trust:
+                    new_settings['debtor_days'] = new_debtor_days
+                    new_settings['debtor_threshold'] = new_debtor_thr
+                
+                data_loader.save_admin_settings(new_settings)
+                
+                st.success("✅ Настройки сохранены")
+                st.cache_data.clear()
+                st.rerun()
+
 
 def main():
     if not check_auth():
@@ -517,25 +1049,33 @@ def main():
         try:
             admin_settings_legend = data_loader.get_admin_settings()
             trust_limits_legend = data_loader.load_trust_limits()
-            
+
+            wd = admin_settings_legend.get('working_days', 60)
+            pd_days = admin_settings_legend.get('passive_days', 90)
+            ld = admin_settings_legend.get('lost_days', 120)
+            rd = admin_settings_legend.get('returned_days', 120)
+            inad = admin_settings_legend.get('inactive_days', 30)
+            ddays = admin_settings_legend.get('debtor_days', 90)
+            dthr = admin_settings_legend.get('debtor_threshold', 2)
+            dthr_val = int(trust_limits_legend.get(f"threshold_{dthr}", 7000))
+
             with st.expander("📖 Легенда обозначений", expanded=False):
                 st.markdown(f"""
-**📊 СТАТУСЫ ПРЕДПРИЯТИЙ**
-
-🆕 **Новое** — первое появление, 1 счёт  
-🔄 **Вернувшееся** — перерыв ≥ {admin_settings_legend.get('returned_days', 300)} дней  
-✅ **Рабочее** — есть счета, работаем  
-😴 **Пассивное** — нет счетов > {admin_settings_legend.get('passive_days', 300)} дней  
-🤝 **Потенциальное** — ведём переговоры
-
-**🏷️ МЕТКИ** (могут быть одновременно)
-
-💀 **Чёрный список** — не работаем  
-🏆 **Золотой фонд** — приоритетные  
-⏰ **Нет заявок** — нет счетов > {admin_settings_legend.get('inactive_days', 60)} дней  
-💸 **Должник** — дебиторка > {admin_settings_legend.get('debtor_days', 90)} дней или ≥ порог {admin_settings_legend.get('debtor_threshold', 2)} ({int(trust_limits_legend.get(f"threshold_{admin_settings_legend.get('debtor_threshold', 2)}", 7000))} BYN)  
-💰 **Дебиторка** — есть долг, но < {admin_settings_legend.get('debtor_days', 90)} дней и < порог {admin_settings_legend.get('debtor_threshold', 2)} ({int(trust_limits_legend.get(f"threshold_{admin_settings_legend.get('debtor_threshold', 2)}", 7000))} BYN)
-                """)
+**📊 СТАТУСЫ ПРЕДПРИЯТИЙ**<br><br>
+🆕 **Новое** — первый счёт в текущем календарном месяце<br>
+🔄 **Камбэки** — перерыв > {rd} дней, последний счёт в текущем месяце<br>
+✅ **Актив** — от последнего счёта ≤ {wd} дней<br>
+😴 **Пассив** — от {wd + 1} до {pd_days} дней без счетов<br>
+🗑️ **Потери** — > {pd_days} дней без счетов<br>
+🤝 **Потенциальное** — ведём переговоры (вручную)<br><br>
+**🏷️ МЕТКИ** (могут быть одновременно)<br><br>
+💀 **ЧС** — не работаем (вручную)<br>
+⚖️ **Суд** — есть непогашенный долг, переданный юристам<br>
+🏆 **Золотой фонд** — приоритетные (вручную)<br>
+⏰ **Нет заявок** — нет счетов > {inad} дней и нет дебиторки<br>
+💰 **Дебиторка** — есть долг, но < {ddays} дней и < порог {dthr} ({dthr_val} BYN)<br>
+💸 **Должник** — дебиторка > {ddays} дней или ≥ порог {dthr} ({dthr_val} BYN)
+                """, unsafe_allow_html=True)
         except Exception as e:
             st.caption(f"⚠️ Легенда недоступна: {e}")
 
@@ -734,7 +1274,7 @@ def main():
     by_mgr_payments.columns = ['manager', 'amount']
     top3_payments = by_mgr_payments.sort_values('amount', ascending=False).head(3)
 
-    by_mgr_debt = data_loader.get_debt_by_manager(df, selected_periods)
+    by_mgr_debt = data_loader.get_debt_by_manager(df)
     top3_debt = by_mgr_debt.sort_values('debt', ascending=False).head(3) if not by_mgr_debt.empty else pd.DataFrame()
 
     medals = ['🥇', '🥈', '🥉']
@@ -788,7 +1328,6 @@ def main():
 
     tab_objects = st.tabs([v for _, v in visible_tabs])
     tab_map = {k: tab_objects[i] for i, (k, _) in enumerate(visible_tabs)}
-
     # ===== TAB1: ПРЕДПРИЯТИЯ =====
     if 'tab1' in tab_map:
         with tab_map['tab1']:
@@ -849,28 +1388,78 @@ def main():
                 trust_limits=trust_limits
             )
 
-            # KPI (8 блоков)
+            # Считаем оба представления:
+            # cat_counts — Способ 1 (приоритет, для круговой и списков)
+            # counts     — Способ 2 (независимо, для KPI меток)
+            # Круговая — по приоритету (одно предприятие — один сектор)
             cat_counts = data_loader.get_companies_by_category(summary, selected_manager)
+            # Табы — по меткам (могут пересекаться)
+            metka_counts = data_loader.get_companies_by_metka(summary, selected_manager)
+            # Независимый подсчёт для KPI меток
+            counts = data_loader.get_independent_counts(summary, selected_manager)
 
-            k1, k2, k3, k4 = st.columns(4)
+            # Всего — по фильтру менеджера
+            if selected_manager == 'Все менеджеры':
+                total_count = len(summary)
+            else:
+                total_count = sum(
+                    1 for m in summary.values()
+                    if m.get('manager') == selected_manager
+                )
+
+            # Статусы для ряда 1–2 — из cat_counts (Способ 1)
+            status_working = len(cat_counts.get('working', []))
+            status_passive = len(cat_counts.get('passive', []))
+            status_new = len(cat_counts.get('new', []))
+            status_lost = len(cat_counts.get('lost', []))
+            status_returned = len(cat_counts.get('returned', []))
+            status_potential = len(cat_counts.get('potential', []))
+
+            # Метки для ряда 3 — из counts (Способ 2, независимо)
+            metka_blacklist = counts.get('blacklist', 0)
+            metka_court = counts.get('court', 0)
+            metka_golden = counts.get('golden_fund', 0)
+            metka_debtor = counts.get('debtor', 0)
+            metka_debitorka = counts.get('debitorka', 0)
+            metka_inactive = counts.get('inactive', 0)
+
+            # ===== СТАТУСЫ =====
+            st.markdown("**📊 Статусы** (предприятие в одной категории)")
+
+            k1, k2, k3 = st.columns(3)
             with k1:
-                st.markdown(f'<div class="metric-box-small"><h3>🏢 Всего</h3><p>{len(summary) if selected_manager == "Все менеджеры" else sum(len(v) for v in cat_counts.values())}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>✅ Актив</h3><p>{status_working}</p></div>', unsafe_allow_html=True)
             with k2:
-                st.markdown(f'<div class="metric-box-small"><h3>💀 ЧС</h3><p>{len(cat_counts["blacklist"])}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>🏢 Всего</h3><p>{total_count}</p></div>', unsafe_allow_html=True)
             with k3:
-                st.markdown(f'<div class="metric-box-small"><h3>🏆 Золотой фонд</h3><p>{len(cat_counts["golden_fund"])}</p></div>', unsafe_allow_html=True)
-            with k4:
-                st.markdown(f'<div class="metric-box-small"><h3>🆕 Новые</h3><p>{len(cat_counts["new"])}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>😴 Пассив</h3><p>{status_passive}</p></div>', unsafe_allow_html=True)
 
-            k5, k6, k7, k8 = st.columns(4)
+            k4, k5, k6, k7 = st.columns(4)
+            with k4:
+                st.markdown(f'<div class="metric-box-small"><h3>🆕 Новое</h3><p>{status_new}</p></div>', unsafe_allow_html=True)
             with k5:
-                st.markdown(f'<div class="metric-box-small"><h3>🔄 Вернувшиеся</h3><p>{len(cat_counts["returned"])}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>🗑️ Потери</h3><p>{status_lost}</p></div>', unsafe_allow_html=True)
             with k6:
-                st.markdown(f'<div class="metric-box-small"><h3>🤝 Потенциальные</h3><p>{len(cat_counts["potential"])}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>🔄 Камбэки</h3><p>{status_returned}</p></div>', unsafe_allow_html=True)
             with k7:
-                st.markdown(f'<div class="metric-box-small"><h3>💸 Должники</h3><p>{len(cat_counts["debtor"])}</p></div>', unsafe_allow_html=True)
-            with k8:
-                st.markdown(f'<div class="metric-box-small"><h3>⏰ Нет заявок</h3><p>{len(cat_counts["inactive"])}</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box-small"><h3>🤝 Потенциальные</h3><p>{status_potential}</p></div>', unsafe_allow_html=True)
+
+            # ===== МЕТКИ =====
+            st.markdown("**🏷️ Метки** (могут пересекаться)")
+
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            with m1:
+                st.markdown(f'<div class="metric-box-small"><h3>💀 ЧС</h3><p>{metka_blacklist}</p></div>', unsafe_allow_html=True)
+            with m2:
+                st.markdown(f'<div class="metric-box-small"><h3>⚖️ Суд</h3><p>{metka_court}</p></div>', unsafe_allow_html=True)
+            with m3:
+                st.markdown(f'<div class="metric-box-small"><h3>🏆 Золото</h3><p>{metka_golden}</p></div>', unsafe_allow_html=True)
+            with m4:
+                st.markdown(f'<div class="metric-box-small"><h3>💸 Должник</h3><p>{metka_debtor}</p></div>', unsafe_allow_html=True)
+            with m5:
+                st.markdown(f'<div class="metric-box-small"><h3>💰 Дебиторка</h3><p>{metka_debitorka}</p></div>', unsafe_allow_html=True)
+            with m6:
+                st.markdown(f'<div class="metric-box-small"><h3>⏰ Нет заявок</h3><p>{metka_inactive}</p></div>', unsafe_allow_html=True)
 
             st.divider()
 
@@ -899,41 +1488,46 @@ def main():
                 else:
                     st.info("Нет данных")
 
+            show_trust = admin_settings.get('show_trust_limits', True)
+
             with chart_col2:
-                st.markdown("**Превышение лимита доверия**")
-                t1 = trust_limits.get('threshold_1', 5000)
-                t2 = trust_limits.get('threshold_2', 7000)
-                t3 = trust_limits.get('threshold_3', 10000)
+                if show_trust:
+                    st.markdown("**Превышение лимита доверия**")
+                    t1 = trust_limits.get('threshold_1', 5000)
+                    t2 = trust_limits.get('threshold_2', 7000)
+                    t3 = trust_limits.get('threshold_3', 10000)
 
-                over_t1 = 0
-                over_t2 = 0
-                over_t3 = 0
+                    over_t1 = 0
+                    over_t2 = 0
+                    over_t3 = 0
 
-                for code, m in summary.items():
-                    if selected_manager != 'Все менеджеры' and m.get('manager') != selected_manager:
-                        continue
-                    debt = m.get('debt_amount', 0)
-                    if debt >= t3:
-                        over_t3 += 1
-                    elif debt >= t2:
-                        over_t2 += 1
-                    elif debt >= t1:
-                        over_t1 += 1
+                    for code, m in summary.items():
+                        if selected_manager != 'Все менеджеры' and m.get('manager') != selected_manager:
+                            continue
+                        debt = m.get('debt_amount', 0)
+                        if debt >= t3:
+                            over_t3 += 1
+                        elif debt >= t2:
+                            over_t2 += 1
+                        elif debt >= t1:
+                            over_t1 += 1
 
-                bar_df = pd.DataFrame({
-                    'Порог': [f'≥ {int(t1)}', f'≥ {int(t2)}', f'≥ {int(t3)}'],
-                    'Кол-во': [over_t1, over_t2, over_t3]
-                })
-                fig = px.bar(
-                    bar_df, x='Порог', y='Кол-во',
-                    color='Порог',
-                    color_discrete_sequence=['#F4D03F', '#F5B041', '#EC7063']
-                )
-                fig.update_traces(
-                    hovertemplate='<b>%{x} BYN</b><br>%{y} предприятий<extra></extra>'
-                )
-                fig.update_layout(showlegend=False, height=400)
-                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                    bar_df = pd.DataFrame({
+                        'Порог': [f'≥ {int(t1)}', f'≥ {int(t2)}', f'≥ {int(t3)}'],
+                        'Кол-во': [over_t1, over_t2, over_t3]
+                    })
+                    fig = px.bar(
+                        bar_df, x='Порог', y='Кол-во',
+                        color='Порог',
+                        color_discrete_sequence=['#F4D03F', '#F5B041', '#EC7063']
+                    )
+                    fig.update_traces(
+                        hovertemplate='<b>%{x} BYN</b><br>%{y} предприятий<extra></extra>'
+                    )
+                    fig.update_layout(showlegend=False, height=400)
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                else:
+                    st.info("")
 
             st.divider()
 
@@ -944,25 +1538,42 @@ def main():
             if not df_companies.empty:
                 display = df_companies.copy()
                 display['debt_amount'] = display['debt_amount'].apply(format_int)
+                display['court_amount'] = display['court_amount'].apply(format_int)
+                display['overpay_amount'] = display['overpay_amount'].apply(format_int)
 
                 status_map = {
                     'new': '🆕 Новое',
-                    'returned': '🔄 Вернувшееся',
-                    'working': '✅ Рабочее',
-                    'passive': '😴 Пассивное',
+                    'returned': '🔄 Камбэки',
+                    'working': '✅ Актив',
+                    'passive': '😴 Пассив',
+                    'lost': '🗑️ Потери',
                     'potential': '🤝 Потенциальное',
                 }
                 display['status_display'] = display['status'].map(status_map).fillna(display['status'])
 
                 display = display[['company_code', 'company_name', 'oblast', 'raion', 'manager',
-                                    'debt_amount', 'status_display', 'metki']]
+                                    'debt_amount', 'court_amount', 'overpay_amount',
+                                    'status_display', 'metki']]
                 display.columns = ['Код', 'Название', 'Область', 'Район', 'Менеджер',
-                                    'Дебиторка, BYN', 'Статус', 'Метки']
+                                    'Дебиторка, BYN', 'В суде, BYN', 'Переплата, BYN',
+                                    'Статус', 'Метки']
 
                 st.dataframe(display, use_container_width=True, hide_index=True)
                 st.caption(f"Всего: {len(df_companies)} предприятий")
             else:
                 st.info("Нет данных")
+
+            st.divider()
+
+            # Управление статусом «Потенциальный»
+            render_potential_manager(summary, admin_settings, selected_manager)
+
+            # Показать сохранённые сообщения
+            for key in list(st.session_state.keys()):
+                if key.startswith('pot_action_'):
+                    st.success(st.session_state.pop(key))
+                elif key.startswith('pot_error_'):
+                    st.error(st.session_state.pop(key))
 
             st.divider()
 
@@ -982,25 +1593,38 @@ def main():
                 reverse=True
             )
 
-            list_tabs = st.tabs([
-                f"💀 ЧС ({len(cat_counts['blacklist'])})",
-                f"🏆 Золото ({len(cat_counts['golden_fund'])})",
-                f"🆕 Новые ({len(cat_counts['new'])})",
-                f"🔄 Вернувшиеся ({len(cat_counts['returned'])})",
-                f"🤝 Потенциальные ({len(cat_counts['potential'])})",
-                f"💸 Должники ({len(cat_counts['debtor'])})",
-                f"💰 Дебиторка ({len(cat_counts['debitorka'])})",
-                f"⏰ Нет заявок ({len(cat_counts['inactive'])})",
-                f"⚠️ Превышение лимита ({len(over_limit_codes)})",
-            ])
+            show_trust = admin_settings.get('show_trust_limits', True)
 
+            tab_names = [
+                f"💀 ЧС ({len(metka_counts['blacklist'])})",
+                f"🏆 Золото ({len(metka_counts['golden_fund'])})",
+                f"🆕 Новые ({len(metka_counts['new'])})",
+                f"🔄 Камбэки ({len(metka_counts['returned'])})",
+                f"🤝 Потенциальные ({len(metka_counts['potential'])})",
+                f"💸 Должники ({len(metka_counts['debtor'])})",
+                f"💰 Дебиторка ({len(metka_counts['debitorka'])})",
+                f"⏰ Нет заявок ({len(metka_counts['inactive'])})",
+                f"⚖️ Суд ({len(metka_counts['court'])})",
+            ]
+            if show_trust:
+                tab_names.append(f"⚠️ Превышение лимита ({len(over_limit_codes)})")
+            overpay_count = sum(
+                1 for c, m in summary.items()
+                if m.get('overpay_amount', 0) > 0.5
+                and (selected_manager == 'Все менеджеры' or m.get('manager') == selected_manager)
+            )
+            tab_names.append(f"💸 Переплаты ({overpay_count})")
+
+            list_tabs = st.tabs(tab_names)
             list_categories = ['blacklist', 'golden_fund', 'new', 'returned',
-                                'potential', 'debtor', 'debitorka', 'inactive']
+                                'potential', 'debtor', 'debitorka', 'inactive', 'court']
+            list_categories = ['blacklist', 'golden_fund', 'new', 'returned',
+                                'potential', 'debtor', 'debitorka', 'inactive', 'court']
 
             # Существующие 8 табов
             for i, cat in enumerate(list_categories):
                 with list_tabs[i]:
-                    codes = cat_counts.get(cat, [])
+                    codes = metka_counts.get(cat, [])
                     if not codes:
                         st.info("Пусто")
                         continue
@@ -1008,55 +1632,274 @@ def main():
                     rows = []
                     for code in codes:
                         m = summary.get(code, {})
+                        # Для Камбэков — информация о возврате
+                        return_info = '—'
+                        if cat == 'returned':
+                            li = m.get('last_invoice')
+                            if li:
+                                d = li.get('date')
+                                d_str = d.strftime('%d.%m.%Y') if hasattr(d, 'strftime') else str(d)
+                                return_info = f"{d_str} — {format_int(li.get('amount', 0))} BYN"
                         rows.append({
                             'Код': code,
                             'Название': m.get('company_name', ''),
                             'Менеджер': m.get('manager', ''),
                             'Район': m.get('raion', ''),
                             'Дебиторка': format_int(m.get('debt_amount', 0)),
-                            'Дней без заявок': m.get('days_since_last') if m.get('days_since_last') is not None else '—',
+                            'days_col': m.get('last_gap', 0) if cat == 'returned'
+                                        else (m.get('days_since_last') if m.get('days_since_last') is not None else '—'),
+                            'return_info': return_info,
                             'Предсчёт': '✅' if m.get('has_prepayment') else '❌',
                             'Метки': ' • '.join({'💀': '💀 ЧС', '🏆': '🏆 Золото', '🆕': '🆕 Новое', '🔄': '🔄 Вернувшееся', '🤝': '🤝 Потенциальное', '💸': '💸 Должник', '💰': '💰 Дебиторка', '⏰': '⏰ Нет заявок'}.get(e, e) for e in m.get('metki', [])),
                         })
 
                     df_list = pd.DataFrame(rows)
+
+                    # Переименовать колонку: Камбэки → «Перерыв, дней», остальные → «Дней без заявок»
+                    if cat == 'returned':
+                        df_list = df_list.rename(columns={
+                            'days_col': 'Перерыв, дней',
+                            'return_info': 'Возврат (дата — сумма)',
+                        })
+                    else:
+                        df_list = df_list.drop(columns=['return_info'], errors='ignore')
+                        df_list = df_list.rename(columns={'days_col': 'Дней без заявок'})
+
                     st.dataframe(df_list, use_container_width=True, hide_index=True)
                     st.caption(f"Всего: {len(df_list)} предприятий")
 
-            # 9-й таб — Превышение лимита
+            # === РАСШИРЕННЫЙ ТАБ «⚖️ СУД» ===
+            # Индекс таба «Суд» — 8
             with list_tabs[8]:
-                if not over_limit_codes:
-                    st.info("Нет предприятий с превышением лимита")
+                # Собираем все court_rows
+                court_df = data_loader.get_all_court_rows(summary, selected_manager)
+
+                # === МЕТРИКИ ===
+                if court_df.empty:
+                    st.info("Нет предприятий в суде за выбранный период")
                 else:
-                    t1 = trust_limits.get('threshold_1', 5000)
-                    t2 = trust_limits.get('threshold_2', 7000)
-                    t3 = trust_limits.get('threshold_3', 10000)
+                    n_companies = court_df['company_code'].nunique()
+                    total_court = court_df['court_amount'].sum()
 
-                    rows = []
-                    for code in over_limit_codes:
-                        m = summary.get(code, {})
-                        debt = m.get('debt_amount', 0)
+                    cm1, cm2 = st.columns(2)
+                    with cm1:
+                        st.markdown(
+                            f'<div class="metric-box">'
+                            f'<h3>⚖️ Предприятий в суде</h3>'
+                            f'<p>{n_companies}</p>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    with cm2:
+                        st.markdown(
+                            f'<div class="metric-box">'
+                            f'<h3>💰 Итого в суде</h3>'
+                            f'<p>{format_int(total_court)}</p>'
+                            f'<h3>BYN</h3>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
 
-                        if debt >= t3:
-                            over_display = f'⚠️⚠️⚠️ ≥ {int(t3)}'
-                        elif debt >= t2:
-                            over_display = f'⚠️⚠️ ≥ {int(t2)}'
+                    st.divider()
+
+                    # === ОБЗОРНАЯ ТАБЛИЦА (существующая — по предприятиям) ===
+                    st.markdown("**Сводка по предприятиям**")
+
+                    # Группируем court_df по предприятию
+                    by_company = court_df.groupby(['company_code', 'company', 'manager', 'raion', 'oblast']).agg({
+                        'court_amount': 'sum',
+                        'court_days': 'max',
+                    }).reset_index()
+                    by_company = by_company.sort_values('court_amount', ascending=False)
+
+                    display_overview = by_company.copy()
+                    display_overview['court_amount'] = display_overview['court_amount'].apply(format_int)
+                    display_overview = display_overview[['company_code', 'company', 'manager', 'raion', 'court_amount', 'court_days']]
+                    display_overview.columns = ['Код', 'Название', 'Менеджер', 'Район', 'В суде, BYN', 'Дней в суде']
+
+                    st.dataframe(display_overview, use_container_width=True, hide_index=True)
+
+                    st.divider()
+
+                    # === ДЕТАЛЬНАЯ ТАБЛИЦА (по счетам) ===
+                    st.markdown("**Детализация по счетам**")
+
+                    display_details = court_df.copy()
+                    display_details['invoice_amount'] = display_details['invoice_amount'].apply(format_int)
+                    display_details['paid_amount'] = display_details['paid_amount'].apply(format_int)
+                    display_details['court_amount'] = display_details['court_amount'].apply(format_int)
+
+                    # Убираем время из дат
+                    display_details['invoice_date'] = pd.to_datetime(
+                        display_details['invoice_date'], errors='coerce'
+                    ).dt.strftime('%d.%m.%Y').fillna('')
+                    display_details['court_date'] = pd.to_datetime(
+                        display_details['court_date'], errors='coerce'
+                    ).dt.strftime('%d.%m.%Y').fillna('')
+
+                    # Пометка переходящего долга
+                    if 'transfer_from' not in display_details.columns:
+                        display_details['transfer_from'] = None
+
+                    def _fmt_transfer(v):
+                        if v is None or pd.isna(v) or v == '':
+                            return '—'
+                        return f'от {v}'
+
+                    display_details['transfer_display'] = display_details['transfer_from'].apply(_fmt_transfer)
+
+                    # Пометка переходящего долга
+                    if 'transfer_from' not in display_details.columns:
+                        display_details['transfer_from'] = None
+
+                    def _fmt_transfer(v):
+                        if v is None or pd.isna(v) or v == '':
+                            return '—'
+                        return f'от {v}'
+
+                    display_details['transfer_display'] = display_details['transfer_from'].apply(_fmt_transfer)
+
+                    display_details = display_details[[
+                        'company_code', 'company', 'manager', 'raion', 'research_type',
+                        'invoice_num', 'invoice_date', 'invoice_amount',
+                        'paid_amount', 'court_amount', 'court_date', 'transfer_display'
+                    ]]
+                    display_details.columns = [
+                        'Код', 'Название', 'Менеджер', 'Район', 'Вид исследования',
+                        'Счёт №', 'Дата счёта', 'Продажа, BYN',
+                        'Оплачено, BYN', 'В суд, BYN', 'Дата в суд', 'Переходящий'
+                    ]
+
+                    st.dataframe(display_details, use_container_width=True, hide_index=True)
+                    st.caption(f"Всего: {len(display_details)} счетов на сумму {format_int(total_court)} BYN")
+
+                    st.divider()
+
+                    # === ДИАГРАММЫ ===
+                    chart1, chart2 = st.columns(2)
+
+                    # По менеджерам
+                    with chart1:
+                        st.markdown("**По менеджерам**")
+                        by_mgr = court_df.groupby('manager')['court_amount'].sum().reset_index()
+                        by_mgr = by_mgr.sort_values('court_amount', ascending=False)
+
+                        if not by_mgr.empty:
+                            by_mgr['amount_str'] = by_mgr['court_amount'].apply(format_int)
+                            fig = px.bar(
+                                by_mgr, x='manager', y='court_amount',
+                                labels={'manager': 'Менеджер', 'court_amount': 'Сумма, BYN'},
+                                color='manager',
+                                color_discrete_sequence=CONTRAST_PALETTE,
+                                custom_data=['amount_str']
+                            )
+                            fig.update_traces(
+                                hovertemplate='<b>%{x}</b><br>%{customdata[0]} BYN<extra></extra>'
+                            )
+                            fig.update_layout(
+                                showlegend=False,
+                                yaxis=dict(automargin=True, tickformat=',.0f'),
+                                margin=dict(l=20, r=20)
+                            )
+                            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+                    # По месяцам
+                    with chart2:
+                        st.markdown("**По месяцам (дата передачи в суд)**")
+                        court_df['court_month'] = pd.to_datetime(court_df['court_date'], errors='coerce').dt.strftime('%Y-%m')
+                        by_month = court_df.groupby('court_month')['court_amount'].sum().reset_index()
+                        by_month = by_month[by_month['court_month'].notna()]
+                        by_month = by_month.sort_values('court_month')
+
+                        if not by_month.empty:
+                            by_month['label'] = by_month['court_month'].apply(
+                                lambda x: f"{MONTHS_RU[int(x[5:7])]} {x[:4]}" if isinstance(x, str) and len(x) == 7 else ''
+                            )
+                            by_month['amount_str'] = by_month['court_amount'].apply(format_int)
+                            fig = px.bar(
+                                by_month, x='label', y='court_amount',
+                                labels={'label': 'Месяц', 'court_amount': 'Сумма, BYN'},
+                                color='court_amount',
+                                color_continuous_scale='Reds',
+                                custom_data=['amount_str']
+                            )
+                            fig.update_traces(
+                                hovertemplate='<b>%{x}</b><br>%{customdata[0]} BYN<extra></extra>'
+                            )
+                            fig.update_layout(
+                                coloraxis_showscale=False,
+                                yaxis=dict(automargin=True, tickformat=',.0f'),
+                                margin=dict(l=20, r=20)
+                            )
+                            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
                         else:
-                            over_display = f'⚠️ ≥ {int(t1)}'
+                            st.info("Нет данных по датам")
 
+            # Таб «Превышение лимита» — только если show_trust
+            if show_trust:
+                with list_tabs[9]:
+                    if not over_limit_codes:
+                        st.info("Нет предприятий с превышением лимита")
+                    else:
+                        t1 = trust_limits.get('threshold_1', 5000)
+                        t2 = trust_limits.get('threshold_2', 7000)
+                        t3 = trust_limits.get('threshold_3', 10000)
+
+                        rows = []
+                        for code in over_limit_codes:
+                            m = summary.get(code, {})
+                            debt = m.get('debt_amount', 0)
+
+                            if debt >= t3:
+                                over_display = f'⚠️⚠️⚠️ ≥ {int(t3)}'
+                            elif debt >= t2:
+                                over_display = f'⚠️⚠️ ≥ {int(t2)}'
+                            else:
+                                over_display = f'⚠️ ≥ {int(t1)}'
+
+                            rows.append({
+                                'Код': code,
+                                'Название': m.get('company_name', ''),
+                                'Менеджер': m.get('manager', ''),
+                                'Район': m.get('raion', ''),
+                                'Дебиторка': format_int(debt),
+                                'Дней долга': m.get('debt_days_max', 0),
+                                'Превышение': over_display,
+                            })
+
+                        df_list = pd.DataFrame(rows)
+                        st.dataframe(df_list, use_container_width=True, hide_index=True)
+                        st.caption(f"Всего: {len(df_list)} предприятий с превышением лимита")
+
+            # Переплаты — индекс 10, если show_trust, иначе 9
+            overpay_idx = 10 if show_trust else 9
+            with list_tabs[overpay_idx]:
+                overpay_list = [
+                    (code, m) for code, m in summary.items()
+                    if m.get('overpay_amount', 0) > 0.5
+                    and (selected_manager == 'Все менеджеры' or m.get('manager') == selected_manager)
+                ]
+
+                if not overpay_list:
+                    st.info("Нет предприятий с переплатами")
+                else:
+                    rows = []
+                    for code, m in overpay_list:
                         rows.append({
                             'Код': code,
                             'Название': m.get('company_name', ''),
                             'Менеджер': m.get('manager', ''),
                             'Район': m.get('raion', ''),
-                            'Дебиторка': format_int(debt),
-                            'Дней долга': m.get('debt_days_max', 0),
-                            'Превышение': over_display,
+                            'Переплата': format_int(m.get('overpay_amount', 0)),
                         })
+                    df_overpay = pd.DataFrame(rows)
+                    df_overpay = df_overpay.sort_values('Переплата', ascending=False)
+                    st.dataframe(df_overpay, use_container_width=True, hide_index=True)
+                    st.caption(f"Всего: {len(df_overpay)} предприятий с переплатами")
 
-                    df_list = pd.DataFrame(rows)
-                    st.dataframe(df_list, use_container_width=True, hide_index=True)
-                    st.caption(f"Всего: {len(df_list)} предприятий с превышением лимита")
+            # Управление метками и лимитами
+            st.divider()
+            render_admin_settings(summary, selected_manager)
 
     # ===== TAB2: РАЙОНЫ =====
     if 'tab2' in tab_map:
@@ -1320,16 +2163,14 @@ def main():
 
             if selected_manager == 'Все менеджеры':
                 st.subheader("👥 Дебиторка по менеджерам")
-                by_mgr = data_loader.get_debt_by_manager(df, selected_periods)
+                by_mgr = data_loader.get_debt_by_manager(df)
                 if not by_mgr.empty:
                     display = by_mgr.copy()
-                    display['sales'] = display['sales'].apply(format_int)
-                    display['payments'] = display['payments'].apply(format_int)
                     display['debt'] = display['debt'].apply(format_int)
-                    display['percent'] = display['percent'].round(2)
+                    display['court'] = display['court'].apply(format_int)
                     display['debt_share'] = display['debt_share'].round(2)
-                    display = display[['manager', 'sales', 'payments', 'debt', 'percent', 'debt_share']]
-                    display.columns = ['Менеджер', 'Счета, BYN', 'Оплаты, BYN', 'Дебиторка, BYN', '%', 'Доля в общей, %']
+                    display = display[['manager', 'debt', 'court', 'companies', 'debt_share']]
+                    display.columns = ['Менеджер', 'Дебиторка, BYN', 'В суде, BYN', 'Предприятий', 'Доля в общей, %']
                     st.dataframe(display, use_container_width=True, hide_index=True)
 
                     debt_positive = by_mgr[by_mgr['debt'] > 0]
@@ -1624,6 +2465,53 @@ def main():
                     st.rerun()
                 else:
                     st.error("❌ Не удалось сохранить настройки")
+
+    # ===== TAB7: ПРЕДСЧЕТА =====
+    if 'tab7' in tab_map:
+        with tab_map['tab7']:
+            st.subheader("📋 Предсчета")
+
+            prep_df = data_loader.get_prepayments_data(df, selected_periods, selected_manager)
+
+            if prep_df.empty:
+                st.info("Нет предсчетов за выбранный период")
+            else:
+                # KPI
+                total_sum = float(prep_df['invoice_amount'].sum())
+                total_count = len(prep_df)
+                unique_companies = prep_df['company_code'].nunique()
+
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    st.markdown(f'<div class="metric-box"><h3>💰 Сумма предсчетов</h3><p>{format_int(total_sum)}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+                with k2:
+                    st.markdown(f'<div class="metric-box"><h3>📋 Количество</h3><p>{total_count}</p></div>', unsafe_allow_html=True)
+                with k3:
+                    st.markdown(f'<div class="metric-box"><h3>🏢 Хозяйств</h3><p>{unique_companies}</p></div>', unsafe_allow_html=True)
+
+                st.divider()
+
+                # Таблица
+                display = prep_df.copy()
+
+                # Даты без времени
+                display['invoice_date'] = pd.to_datetime(
+                    display['invoice_date'], errors='coerce'
+                ).dt.strftime('%d.%m.%Y').fillna('')
+
+                display['invoice_amount'] = display['invoice_amount'].apply(format_int)
+
+                display = display[[
+                    'company_code', 'company', 'oblast', 'raion', 'manager',
+                    'invoice_amount', 'invoice_date', 'invoice_num', 'research_type',
+                ]]
+                display.columns = [
+                    'Код', 'Название', 'Область', 'Район', 'Менеджер',
+                    'Сумма, BYN', 'Дата', 'Счёт №', 'Вид исследования',
+                ]
+
+                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.caption(f"Всего: {total_count} предсчетов на сумму {format_int(total_sum)} BYN")
 
     # ===== TAB_ACCESS =====
     if 'tab_access' in tab_map:

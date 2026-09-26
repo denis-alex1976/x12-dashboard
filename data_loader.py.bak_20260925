@@ -1005,46 +1005,6 @@ def get_total_prepayments(df_sales):
     return float(prep['invoice_amount'].sum()), int(prep['invoice_num'].nunique())
 
 
-def get_prepayments_data(df, period_selection=None, manager=None):
-    """
-    Возвращает DataFrame с предсчётами (order_type = 1).
-
-    Колонки: company_code, company, oblast, raion, manager,
-             invoice_num, invoice_date, invoice_amount, research_type.
-    Фильтр по периоду (invoice_date) и менеджеру.
-    Сортировка: по дате (новые сверху).
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    work = df[
-        (df['row_type'] == 'sale') &
-        (df['order_type'] == 1)
-    ].copy()
-
-    if work.empty:
-        return pd.DataFrame()
-
-    # Фильтр по менеджеру
-    if manager and manager != 'Все менеджеры':
-        work = work[work['manager'] == manager]
-
-    # Фильтр по периоду
-    if period_selection and 'Весь период' not in period_selection:
-        years, months_2026 = _parse_period_selection(period_selection)
-        mask = pd.Series(False, index=work.index)
-        for y in years:
-            mask |= (work['invoice_date'].dt.year == y)
-        for m in months_2026:
-            mask |= ((work['invoice_date'].dt.year == 2026) & (work['invoice_date'].dt.month == m))
-        work = work[mask]
-
-    # Сортировка по дате (новые сверху)
-    work = work.sort_values('invoice_date', ascending=False)
-
-    return work
-
-
 def get_companies_count(df_sales):
     if df_sales is None or df_sales.empty:
         return 0
@@ -1122,72 +1082,24 @@ def get_sales_by_research(df_sales):
 # === ДЕБИТОРКА ===
 
 def get_debt_summary(df, period_selection=None, manager=None):
-    """
-    Сводка по дебиторке, суду и переплатам — за выбранный период.
-
-    Логика ПОСТРОЧНАЯ (по row_id), как в get_debt_structure.
-    Дебиторка, суд, переплата — только по счетам выбранного периода.
-    Продажи и оплаты — через filter_sales / filter_payments.
-    """
     if df is None or df.empty:
-        return {'sales': 0, 'payments': 0, 'debt': 0, 'court': 0, 'overpay': 0,
-                'percent': 0, 'payments_current': 0, 'payments_old': 0}
+        return {'sales': 0, 'payments': 0, 'debt': 0, 'percent': 0,
+                'payments_current': 0, 'payments_old': 0}
 
-    # Продажи и оплаты — через фильтры
     sales_df = filter_sales(df, period_selection, manager)
     payments_df = filter_payments(df, period_selection, manager)
 
     sales = float(sales_df[sales_df['order_type'] == 0]['invoice_amount'].sum())
     payments = float(payments_df['payment_amount'].sum())
 
-    # === Построчный расчёт дебиторки/суда/переплаты ЗА ПЕРИОД ===
-    # Только счета (order_type == 0)
-    sales_only = sales_df[sales_df['order_type'] == 0].copy()
+    sales_period = filter_sales(df, period_selection, manager)
+    sales_period_keys = sales_period[['company', 'invoice_num', 'invoice_date']].drop_duplicates()
 
-    # Оплаты по row_id — из ВСЕГО df (не только за период), потому что оплата могла прийти позже счёта
-    all_payments = df[df['row_type'] == 'payment']
-    if not all_payments.empty and 'row_id' in all_payments.columns:
-        pay_by_row = all_payments.groupby('row_id')['payment_amount'].sum().to_dict()
-    else:
-        pay_by_row = {}
-
-    # Готовим СУД
-    if 'СУД' not in sales_only.columns:
-        sales_only['СУД'] = 0
-    sales_only['СУД'] = pd.to_numeric(sales_only['СУД'], errors='coerce').fillna(0).astype(int)
-
-    debt = 0.0
-    court = 0.0
-    overpay = 0.0
-
-    for _, row in sales_only.iterrows():
-        row_id = row.get('row_id')
-        inv_amt = float(row.get('invoice_amount') or 0)
-        paid = float(pay_by_row.get(row_id, 0.0))
-
-        paid_part = min(paid, inv_amt)
-        overpay_part = max(0.0, paid - inv_amt)
-        unpaid = inv_amt - paid_part
-
-        overpay += overpay_part
-
-        is_court = int(row.get('СУД', 0)) == 1
-        if is_court:
-            court += unpaid
-        else:
-            debt += unpaid
-
-    # % дебиторки — реальный (относительно продаж за период)
-    percent = (debt / sales * 100) if sales > 0 else 0.0
-
-    # payments_current / payments_old — по старой логике (через ключ счёта)
-    sales_period_keys = sales_only[['company', 'invoice_num', 'invoice_date']].drop_duplicates()
-
-    payments_all_filtered = df[df['row_type'] == 'payment']
+    payments_all = df[df['row_type'] == 'payment']
     if manager and manager != 'Все менеджеры':
-        payments_all_filtered = payments_all_filtered[payments_all_filtered['manager'] == manager]
+        payments_all = payments_all[payments_all['manager'] == manager]
 
-    merged = payments_all_filtered.merge(
+    merged = payments_all.merge(
         sales_period_keys,
         on=['company', 'invoice_num', 'invoice_date'],
         how='inner'
@@ -1197,14 +1109,15 @@ def get_debt_summary(df, period_selection=None, manager=None):
     if payments_old < 0:
         payments_old = 0
 
+    debt = sales - payments if sales > payments else 0
+    percent = (100 - (payments / sales * 100)) if sales > 0 else 0
+
     return {
         'sales': sales,
         'payments': payments,
         'payments_current': payments_current,
         'payments_old': payments_old,
         'debt': debt,
-        'court': court,
-        'overpay': overpay,
         'percent': percent,
     }
 
@@ -1389,7 +1302,7 @@ def get_debt_companies(df, period_selection=None, manager=None):
     rows = []
     for code, m in summary.items():
         if manager and manager != 'Все менеджеры':
-            if m.get('manager') != manager:
+            if manager not in m.get('managers_set', set()):
                 continue
         debt = m.get('debt_amount', 0.0)
         if debt <= 0.5:
@@ -1779,7 +1692,7 @@ def get_client_info():
 
 # === РАСЧЁТ СТАТУСОВ И МЕТОК ПРЕДПРИЯТИЙ ===
 
-def get_company_metrics(company_code, df_company, flags, admin_settings, trust_limits, primary_map=None):
+def get_company_metrics(company_code, df_company, flags, admin_settings, trust_limits):
     """
     Вычисляет метрики одного предприятия.
 
@@ -1820,8 +1733,6 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         'last_invoice_date': None,
         'last_activity_date': None,
         'days_since_last': None,
-        'last_gap': 0,
-        'last_invoice': None,
         'debt_amount': 0.0,
         'debt_days_max': 0,
         'court_amount': 0.0,
@@ -1836,26 +1747,11 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         'debt_by_manager': {},
         'court_by_manager': {},
         'overpay_by_manager': {},
-        'debt_transferred_from': {},
-        'court_transferred_from': {},
-        'overpay_transferred_from': {},
         'managers_set': set(),
     }
 
     # Если нет счетов — «Пассивное» (или ручное «Потенциальное»)
     if sales.empty:
-        # Заполняем основные поля из любой доступной строки (предсчёта тоже подойдут)
-        any_row = df_company[
-            df_company['invoice_date'].notna()
-        ].sort_values('invoice_date', ascending=False)
-        if not any_row.empty:
-            last = any_row.iloc[0]
-            result['company_name'] = last.get('company')
-            result['oblast'] = last.get('oblast')
-            result['raion'] = last.get('raion')
-            result['manager'] = last.get('manager')
-            result['last_activity_date'] = last.get('invoice_date')
-
         if flags.get('status') == 'potential':
             result['status'] = 'potential'
             result['category'] = 'potential'
@@ -1885,46 +1781,12 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         result['manager'] = first_row.get('manager')
         result['last_activity_date'] = None
 
-    # === АКТИВНЫЙ МЕНЕДЖЕР (для привязки долгов) ===
-    active_only = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
-    current_manager = result['manager']
-
-    if current_manager and current_manager in active_only:
-        # Текущий менеджер активный — долги идут ему
-        active_mgr = current_manager
-    elif primary_map:
-        # Текущий неактивный — берём основного по району
-        active_mgr = primary_map.get(company_code, current_manager)
-        # Если основной тоже неактивный — оставляем как есть
-        if active_mgr not in active_only:
-            active_mgr = current_manager
-    else:
-        # Нет primary_map — оставляем текущего
-        active_mgr = current_manager
-
     invoice_dates = sales['invoice_date'].dropna().sort_values()
     if len(invoice_dates) > 0:
         result['first_invoice_date'] = invoice_dates.iloc[0]
         result['last_invoice_date'] = invoice_dates.iloc[-1]
         result['days_since_last'] = (today - invoice_dates.iloc[-1]).days
         result['invoices_count'] = len(invoice_dates)
-        # Разрыв между последней и предпоследней заявкой (для Камбэков)
-        if len(invoice_dates) >= 2:
-            result['last_gap'] = int((invoice_dates.iloc[-1] - invoice_dates.iloc[-2]).days)
-        else:
-            result['last_gap'] = 0
-
-        # === Последний счёт (для отображения в Камбэках) ===
-        last_date = invoice_dates.iloc[-1]
-        last_rows = sales[sales['invoice_date'] == last_date]
-        result['last_invoice'] = {
-            'date': last_date,
-            'num': last_rows['invoice_num'].iloc[0] if 'invoice_num' in last_rows.columns and not last_rows.empty else '',
-            'amount': float(last_rows['invoice_amount'].sum()),
-            'research_type': last_rows['research_type'].iloc[0] if 'research_type' in last_rows.columns and not last_rows.empty else '',
-        }
-    else:
-        result['last_invoice'] = None
 
     # === ПОСТРОЧНЫЙ РАСЧЁТ ДЕБИТОРКИ, СУДА, ПЕРЕПЛАТ ===
     # Собираем оплаты по row_id
@@ -1952,28 +1814,13 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     overpay_by_manager = {}
     managers_set = set()
 
-    # Все менеджеры из ВСЕХ строк (счёт + предсчёт)
-    all_company_rows = df_company[
-        (df_company['row_type'] == 'sale') &
-        (df_company['invoice_date'].notna())
-    ]
-    for _, r in all_company_rows.iterrows():
-        row_manager = r.get('manager')
-        if row_manager:
-            managers_set.add(row_manager)
-
-    # Словари для пометок (переходящий долг)
-    debt_transferred_from = {}
-    court_transferred_from = {}
-    overpay_transferred_from = {}
-
     for _, row in sales.iterrows():
         row_id = row.get('row_id')
         inv_amt = float(row.get('invoice_amount') or 0)
         paid = float(pay_by_row.get(row_id, 0.0))
         row_manager = row.get('manager') or '—'
 
-        # (managers_set заполняется выше из ВСЕХ строк)
+        managers_set.add(row_manager)
 
         paid_part = min(paid, inv_amt)
         overpay = max(0.0, paid - inv_amt)
@@ -1981,18 +1828,8 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
 
         overpay_total += overpay
 
-        # Привязка — к АКТИВНОМУ менеджеру предприятия
-        target_mgr = active_mgr if active_mgr else row_manager
-
-        # Пометка, если строка от ДРУГОГО менеджера
-        is_transferred = (row_manager != target_mgr)
-
         if overpay > 0.5:
-            overpay_by_manager[target_mgr] = overpay_by_manager.get(target_mgr, 0.0) + overpay
-            if is_transferred:
-                overpay_transferred_from.setdefault(target_mgr, {})
-                overpay_transferred_from[target_mgr][row_manager] = \
-                    overpay_transferred_from[target_mgr].get(row_manager, 0.0) + overpay
+            overpay_by_manager[row_manager] = overpay_by_manager.get(row_manager, 0.0) + overpay
 
         is_court = int(row.get('СУД', 0)) == 1
 
@@ -2008,26 +1845,16 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         if debt_part > 0.5:
             days = (today - inv_date).days if pd.notna(inv_date) else 0
             debt_rows.append({'debt': debt_part, 'days': days})
-            debt_by_manager[target_mgr] = debt_by_manager.get(target_mgr, 0.0) + debt_part
-            if is_transferred:
-                debt_transferred_from.setdefault(target_mgr, {})
-                debt_transferred_from[target_mgr][row_manager] = \
-                    debt_transferred_from[target_mgr].get(row_manager, 0.0) + debt_part
+            debt_by_manager[row_manager] = debt_by_manager.get(row_manager, 0.0) + debt_part
 
         if court_part > 0.5:
             c_date = row.get('court_date')
             c_days = (today - c_date).days if pd.notna(c_date) else 0
-            court_by_manager[target_mgr] = court_by_manager.get(target_mgr, 0.0) + court_part
-            if is_transferred:
-                court_transferred_from.setdefault(target_mgr, {})
-                court_transferred_from[target_mgr][row_manager] = \
-                    court_transferred_from[target_mgr].get(row_manager, 0.0) + court_part
-
+            court_by_manager[row_manager] = court_by_manager.get(row_manager, 0.0) + court_part
             court_rows_data.append({
                 'company_code': company_code,
                 'company': row.get('company'),
-                'manager': target_mgr,           # ← активный
-                'transfer_from': row_manager if is_transferred else None,
+                'manager': row.get('manager'),
                 'raion': row.get('raion'),
                 'oblast': row.get('oblast'),
                 'research_type': row.get('research_type'),
@@ -2054,14 +1881,6 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     result['court_by_manager'] = court_by_manager
     result['overpay_by_manager'] = overpay_by_manager
     result['managers_set'] = managers_set
-
-    # Пометки переходящих долгов
-    result['debt_transferred_from'] = debt_transferred_from
-    result['court_transferred_from'] = court_transferred_from
-    result['overpay_transferred_from'] = overpay_transferred_from
-
-    # Активный менеджер (для отображения)
-    result['active_manager'] = active_mgr
 
     # === ПРЕДСЧЁТ ===
     prepayments = df_company[
@@ -2183,12 +2002,10 @@ def calculate_company_metki(result, flags, admin_settings, trust_limits):
         else:
             metki.append('💰')  # Дебиторка
 
-    # 5. Нет заявок — только если НЕТ дебиторки И НЕТ других важных меток (⚖️, 💸)
+    # 5. Нет заявок — только если НЕТ дебиторки вообще
     days_since_last = result.get('days_since_last')
 
-    has_priority_metka = ('⚖️' in metki) or ('💸' in metki)
-
-    if not has_priority_metka and days_since_last is not None:
+    if days_since_last is not None:
         if days_since_last > admin_settings.get('inactive_days', 30) and debt < 0.5:
             metki.append('⏰')
 
@@ -2237,10 +2054,10 @@ def get_priority_category(result, flags):
 def get_all_companies_summary(df, flags=None, admin_settings=None, trust_limits=None):
     """
     Считает метрики для ВСЕХ предприятий.
-    Два прохода: первый — базовый summary, второй — с учётом primary_map.
+    Возвращает dict {company_code: metrics_dict}.
     """
     if flags is None:
-        flags = load_company_flags() or {}
+        flags = load_company_flags()
     if admin_settings is None:
         admin_settings = get_admin_settings()
     if trust_limits is None:
@@ -2254,7 +2071,6 @@ def get_all_companies_summary(df, flags=None, admin_settings=None, trust_limits=
     # Группируем по company_code
     grouped = df.groupby('company_code')
 
-    # Первый проход: базовый summary (для primary_map)
     for code, df_company in grouped:
         code_str = str(code).strip()
         if not code_str or code_str == 'nan':
@@ -2268,156 +2084,10 @@ def get_all_companies_summary(df, flags=None, admin_settings=None, trust_limits=
             flags=company_flags,
             admin_settings=admin_settings,
             trust_limits=trust_limits,
-            primary_map=None,  # первый проход без primary
-        )
-        summary[code_str] = metrics
-
-    # Считаем primary_map
-    primary_map = get_primary_manager_by_raion(summary)
-
-    # Второй проход: пересчёт с учётом primary_map
-    for code, df_company in grouped:
-        code_str = str(code).strip()
-        if not code_str or code_str == 'nan':
-            continue
-
-        company_flags = flags.get(code_str, {})
-
-        metrics = get_company_metrics(
-            company_code=code_str,
-            df_company=df_company,
-            flags=company_flags,
-            admin_settings=admin_settings,
-            trust_limits=trust_limits,
-            primary_map=primary_map,
         )
         summary[code_str] = metrics
 
     return summary
-
-
-def get_primary_manager_by_raion(summary):
-    """
-    Определяет основного менеджера для каждого предприятия.
-
-    Логика:
-    1. Группируем по районам: {raion: {manager: count}}
-    2. Основной — тот, у кого БОЛЬШЕ ВСЕГО предприятий в районе,
-       но только из ACTIVE_MANAGERS.
-    3. При равенстве — первый по алфавиту.
-    4. Если в районе нет активных — берём последнего менеджера предприятия.
-    5. Если raion пустой — берём последнего менеджера предприятия.
-
-    Возвращает: {company_code: primary_manager_name}
-    """
-    active_only = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
-
-    # Группируем: {raion: {manager: count}} — только активные
-    raion_counts = {}
-    for code, m in summary.items():
-        raion = m.get('raion')
-        manager = m.get('manager')
-        if not raion or pd.isna(raion):
-            continue
-        if not manager:
-            continue
-        if manager not in active_only:
-            continue  # неактивных не считаем
-        if raion not in raion_counts:
-            raion_counts[raion] = {}
-        raion_counts[raion][manager] = raion_counts[raion].get(manager, 0) + 1
-
-    # Определяем основного для каждого района
-    raion_primary = {}
-    for raion, counts in raion_counts.items():
-        # max по количеству, при равенстве — первый по алфавиту
-        primary = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
-        raion_primary[raion] = primary
-
-    # Для каждого предприятия
-    result = {}
-    for code, m in summary.items():
-        raion = m.get('raion')
-        manager = m.get('manager')
-
-        # 1. Если последний менеджер — активный, он и основной
-        if manager and manager in active_only:
-            result[code] = manager
-            continue
-
-        # 2. Иначе — определяем по району
-        if raion and not pd.isna(raion) and raion in raion_primary:
-            result[code] = raion_primary[raion]
-        else:
-            # Нет района / нет активных — берём последнего менеджера
-            result[code] = manager or '—'
-
-    return result
-
-
-def format_managers_display(primary, managers_set):
-    """
-    Формирует строку для колонки «Менеджер»:
-    {primary} / (подмена) {подменный1} / (подмена) {подменный2}
-
-    Подменные — только АКТИВНЫЕ, по алфавиту.
-    Если primary неактивный — показываем с пометкой ⚠️.
-    """
-    active_only = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
-
-    # Формируем отображение основного
-    if primary and primary in active_only:
-        primary_display = primary
-    elif primary:
-        primary_display = f"{primary} ⚠️"
-    else:
-        primary_display = '—'
-
-    if not managers_set:
-        return primary_display
-
-    # Подменные — только активные, по алфавиту
-    others = sorted([m for m in managers_set if m and m != primary and m in active_only])
-
-    if not others:
-        return primary_display
-
-    parts = [primary_display]
-    for mgr in others:
-        parts.append(f"(подмена) {mgr}")
-
-    return ' / '.join(parts)
-
-
-def get_all_court_rows(summary, manager_filter=None):
-    """
-    Собирает все court_rows из всех предприятий в один DataFrame.
-
-    manager_filter — фильтр по ТЕКУЩЕМУ менеджеру предприятия (m['manager']).
-    """
-    if not summary:
-        return pd.DataFrame()
-
-    rows = []
-    for code, m in summary.items():
-        # Фильтр по текущему менеджеру предприятия
-        if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
-                continue
-
-        court_rows = m.get('court_rows') or []
-        for cr in court_rows:
-            # Гарантируем наличие transfer_from
-            if 'transfer_from' not in cr:
-                cr['transfer_from'] = None
-            rows.append(cr)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df_res = pd.DataFrame(rows)
-    df_res = df_res.sort_values('court_amount', ascending=False)
-    return df_res
 
 
 def get_summary_cached(df, force=False, flags=None, admin_settings=None, trust_limits=None):
@@ -2427,23 +2097,16 @@ def get_summary_cached(df, force=False, flags=None, admin_settings=None, trust_l
     """
     global _summary_cache
     now = datetime.now()
-
-    if flags is None:
-        flags = load_company_flags() or {}
-    if admin_settings is None:
-        admin_settings = get_admin_settings()
-    if trust_limits is None:
-        trust_limits = load_trust_limits()
-
-    if (force or
-            _summary_cache['data'] is None or
+    
+    if (force or 
+            _summary_cache['data'] is None or 
             _summary_cache['time'] is None or
             (now - _summary_cache['time']).total_seconds() > SUMMARY_TTL):
         _summary_cache['data'] = get_all_companies_summary(
             df, flags, admin_settings, trust_limits
         )
         _summary_cache['time'] = now
-
+    
     return _summary_cache['data']
 
 
@@ -2478,7 +2141,7 @@ def get_companies_by_category(summary, manager_filter=None):
     for code, metrics in summary.items():
         # Фильтр по менеджеру
         if manager_filter and manager_filter != 'Все менеджеры':
-            if metrics.get('manager') != manager_filter:
+            if manager_filter not in metrics.get('managers_set', set()):
                 continue
 
         cat = metrics.get('category', 'working')
@@ -2486,54 +2149,6 @@ def get_companies_by_category(summary, manager_filter=None):
             result[cat].append(code)
         else:
             result['working'].append(code)
-
-    return result
-
-
-def get_companies_by_metka(summary, manager_filter=None):
-    """
-    Группирует предприятия по МЕТКАМ (не по приоритету).
-
-    Метки могут пересекаться — одно предприятие может быть в нескольких категориях.
-
-    Возвращает dict {category: [list of company_codes]}.
-
-    Для статусов (new, returned, potential) — по статусу.
-    Для меток (blacklist, golden_fund, court, debtor, debitorka, inactive) — по метке.
-    """
-    result = {cat: [] for cat in CATEGORY_ORDER}
-
-    for code, m in summary.items():
-        # Фильтр по менеджеру
-        if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
-                continue
-
-        metki = m.get('metki', [])
-        status = m.get('status', 'working')
-
-        # === СТАТУСЫ (по одному на предприятие) ===
-        if status == 'new':
-            result['new'].append(code)
-        if status == 'returned':
-            result['returned'].append(code)
-        if status == 'potential':
-            result['potential'].append(code)
-        # working / passive / lost — не табы, а общий список
-
-        # === МЕТКИ (могут пересекаться) ===
-        if '💀' in metki:
-            result['blacklist'].append(code)
-        if '🏆' in metki:
-            result['golden_fund'].append(code)
-        if '⚖️' in metki:
-            result['court'].append(code)
-        if '💸' in metki:
-            result['debtor'].append(code)
-        if '💰' in metki:
-            result['debitorka'].append(code)
-        if '⏰' in metki:
-            result['inactive'].append(code)
 
     return result
 
@@ -2563,7 +2178,7 @@ def get_independent_counts(summary, manager_filter=None):
 
     for code, m in summary.items():
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if manager_filter not in m.get('managers_set', set()):
                 continue
 
         # Статус — один на предприятие
@@ -2612,7 +2227,7 @@ def get_companies_with_metki_df(summary, manager_filter=None):
     rows = []
     for code, m in summary.items():
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if manager_filter not in m.get('managers_set', set()):
                 continue
 
         metki_raw = m.get('metki', [])
