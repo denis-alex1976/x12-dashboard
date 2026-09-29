@@ -532,6 +532,16 @@ def render_access_tab():
 
             st.divider()
 
+            # Прочие настройки
+            st.markdown("**⚙️ Прочие настройки**")
+            new_allow_bonus = st.checkbox(
+                "💰 Настройки бонусов — админы могут менять",
+                value=admin_settings.get('allow_admins_bonus_settings', True),
+                key="res_allow_bonus"
+            )
+
+            st.divider()
+
             # Видимость
             st.markdown("**👁️ Видимость**")
             new_show_trust = st.checkbox(
@@ -548,6 +558,7 @@ def render_access_tab():
                 new_settings['allow_admins_status_days'] = new_allow_status
                 new_settings['allow_admins_inactive_days'] = new_allow_inactive
                 new_settings['allow_admins_potential_days'] = new_allow_potential
+                new_settings['allow_admins_bonus_settings'] = new_allow_bonus
                 new_settings['show_trust_limits'] = new_show_trust
 
                 if data_loader.save_admin_settings(new_settings):
@@ -1641,7 +1652,7 @@ def main():
                                 d_str = d.strftime('%d.%m.%Y') if hasattr(d, 'strftime') else str(d)
                                 return_info = f"{d_str} — {format_int(li.get('amount', 0))} BYN"
                         rows.append({
-                            'Код': code,
+                            'Код': m.get('company_code') or code,
                             'Название': m.get('company_name', ''),
                             'Менеджер': m.get('manager', ''),
                             'Район': m.get('raion', ''),
@@ -1858,7 +1869,7 @@ def main():
                                 over_display = f'⚠️ ≥ {int(t1)}'
 
                             rows.append({
-                                'Код': code,
+                                'Код': m.get('company_code') or code,
                                 'Название': m.get('company_name', ''),
                                 'Менеджер': m.get('manager', ''),
                                 'Район': m.get('raion', ''),
@@ -1886,7 +1897,7 @@ def main():
                     rows = []
                     for code, m in overpay_list:
                         rows.append({
-                            'Код': code,
+                            'Код': m.get('company_code') or code,
                             'Название': m.get('company_name', ''),
                             'Менеджер': m.get('manager', ''),
                             'Район': m.get('raion', ''),
@@ -2321,31 +2332,33 @@ def main():
 
             st.divider()
 
-            st.subheader("👥 Оплаты по менеджерам")
+            # Таблица «Оплаты по менеджерам» — только для админа и суперадмина
+            if user_role in ('admin', 'super_admin'):
+                st.subheader("👥 Оплаты по менеджерам")
 
-            by_mgr_pay = data_loader.get_payments_by_manager(df, selected_periods, bonus_settings)
-            if not by_mgr_pay.empty:
-                display = by_mgr_pay.copy()
-                display['payments'] = display['payments'].apply(format_int)
-                display['bonus'] = display['bonus'].apply(format_int)
-                display['share'] = display['share'].round(2)
-                display = display[['manager', 'payments', 'share', 'bonus', 'count']]
-                display.columns = ['Менеджер', 'Оплаты, BYN', 'Доля, %', 'Бонус, BYN', 'Кол-во оплат']
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                by_mgr_pay = data_loader.get_payments_by_manager(df, selected_periods, bonus_settings)
+                if not by_mgr_pay.empty:
+                    display = by_mgr_pay.copy()
+                    display['payments'] = display['payments'].apply(format_int)
+                    display['bonus'] = display['bonus'].apply(format_int)
+                    display['share'] = display['share'].round(2)
+                    display = display[['manager', 'payments', 'share', 'bonus', 'count']]
+                    display.columns = ['Менеджер', 'Оплаты, BYN', 'Доля, %', 'Бонус, BYN', 'Кол-во оплат']
+                    st.dataframe(display, use_container_width=True, hide_index=True)
 
-                pie_data = by_mgr_pay[by_mgr_pay['payments'] > 0].copy()
-                fig = px.pie(
-                    pie_data,
-                    values='payments', names='manager',
-                    color='manager',
-                    color_discrete_sequence=CONTRAST_PALETTE
-                )
-                fig.update_traces(
-                    hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>'
-                )
-                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-            else:
-                st.info("Нет данных")
+                    pie_data = by_mgr_pay[by_mgr_pay['payments'] > 0].copy()
+                    fig = px.pie(
+                        pie_data,
+                        values='payments', names='manager',
+                        color='manager',
+                        color_discrete_sequence=CONTRAST_PALETTE
+                    )
+                    fig.update_traces(
+                        hovertemplate='<b>%{label}</b><br>%{value:,.0f} BYN<br>%{percent}<extra></extra>'
+                    )
+                    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                else:
+                    st.info("Нет данных")
 
             st.divider()
 
@@ -2381,90 +2394,98 @@ def main():
             else:
                 st.info("Нет оплат за выбранный период")
 
-            st.divider()
+            # Настройки бонусов — только для админа (если разрешено) и суперадмина
+            admin_settings_for_bonus = data_loader.get_admin_settings()
+            can_edit_bonus = (
+                user_role == 'super_admin' or
+                (user_role == 'admin' and admin_settings_for_bonus.get('allow_admins_bonus_settings', True))
+            )
 
-            st.subheader("⚙️ Настройки бонусов")
+            if can_edit_bonus:
+                st.divider()
 
-            bonus_settings = data_loader.get_bonus_settings()
+                st.subheader("⚙️ Настройки бонусов")
 
-            col_chk1, col_chk2 = st.columns(2)
-            with col_chk1:
-                use_by_category = st.checkbox(
-                    "Использовать бонус по категориям дебиторки",
-                    value=bonus_settings.get('use_by_category', False),
-                    key="use_by_category"
-                )
-            with col_chk2:
-                use_by_threshold = st.checkbox(
-                    "Использовать бонус по порогу оплат",
-                    value=bonus_settings.get('use_by_threshold', False),
-                    key="use_by_threshold"
-                )
+                bonus_settings = data_loader.get_bonus_settings()
 
-            if use_by_category:
-                st.markdown("**Ставки по категориям дебиторки**")
-                rates = bonus_settings.get('rates_by_category', {})
-                rc1, rc2, rc3, rc4, rc5 = st.columns(5)
-                with rc1:
-                    r_0_30 = st.number_input("0-30 дн., %", value=float(rates.get('0-30', 0.0)), step=0.1, format="%.2f", key="r_0_30")
-                with rc2:
-                    r_31_60 = st.number_input("31-60 дн., %", value=float(rates.get('31-60', 0.0)), step=0.1, format="%.2f", key="r_31_60")
-                with rc3:
-                    r_61_90 = st.number_input("61-90 дн., %", value=float(rates.get('61-90', 0.0)), step=0.1, format="%.2f", key="r_61_90")
-                with rc4:
-                    r_91_120 = st.number_input("91-120 дн., %", value=float(rates.get('91-120', 0.0)), step=0.1, format="%.2f", key="r_91_120")
-                with rc5:
-                    r_120 = st.number_input("120+ дн., %", value=float(rates.get('120+', 0.0)), step=0.1, format="%.2f", key="r_120")
-            else:
-                r_0_30 = r_31_60 = r_61_90 = r_91_120 = r_120 = 0.0
+                col_chk1, col_chk2 = st.columns(2)
+                with col_chk1:
+                    use_by_category = st.checkbox(
+                        "Использовать бонус по категориям дебиторки",
+                        value=bonus_settings.get('use_by_category', False),
+                        key="use_by_category"
+                    )
+                with col_chk2:
+                    use_by_threshold = st.checkbox(
+                        "Использовать бонус по порогу оплат",
+                        value=bonus_settings.get('use_by_threshold', False),
+                        key="use_by_threshold"
+                    )
 
-            if use_by_threshold:
-                st.markdown("**Пороги оплат и ставки**")
-                thr = bonus_settings.get('thresholds', [
-                    {'min_amount': 20000, 'rate': 0.0},
-                    {'min_amount': 30000, 'rate': 0.0},
-                    {'min_amount': 50000, 'rate': 0.0},
-                ])
-                while len(thr) < 3:
-                    thr.append({'min_amount': 0, 'rate': 0.0})
-
-                tc1, tc2, tc3 = st.columns(3)
-                with tc1:
-                    t1_amount = st.number_input("Порог 1, BYN", value=float(thr[0].get('min_amount', 0)), step=1000.0, format="%.0f", key="t1_amount")
-                    t1_rate = st.number_input("Ставка 1, %", value=float(thr[0].get('rate', 0.0)), step=0.1, format="%.2f", key="t1_rate")
-                with tc2:
-                    t2_amount = st.number_input("Порог 2, BYN", value=float(thr[1].get('min_amount', 0)), step=1000.0, format="%.0f", key="t2_amount")
-                    t2_rate = st.number_input("Ставка 2, %", value=float(thr[1].get('rate', 0.0)), step=0.1, format="%.2f", key="t2_rate")
-                with tc3:
-                    t3_amount = st.number_input("Порог 3, BYN", value=float(thr[2].get('min_amount', 0)), step=1000.0, format="%.0f", key="t3_amount")
-                    t3_rate = st.number_input("Ставка 3, %", value=float(thr[2].get('rate', 0.0)), step=0.1, format="%.2f", key="t3_rate")
-            else:
-                t1_amount = t2_amount = t3_amount = 0.0
-                t1_rate = t2_rate = t3_rate = 0.0
-
-            if st.button("💾 Сохранить настройки бонусов", key="save_bonus_settings_btn"):
-                new_settings = {
-                    'use_by_category': use_by_category,
-                    'use_by_threshold': use_by_threshold,
-                    'rates_by_category': {
-                        '0-30': r_0_30,
-                        '31-60': r_31_60,
-                        '61-90': r_61_90,
-                        '91-120': r_91_120,
-                        '120+': r_120,
-                    },
-                    'thresholds': [
-                        {'min_amount': t1_amount, 'rate': t1_rate},
-                        {'min_amount': t2_amount, 'rate': t2_rate},
-                        {'min_amount': t3_amount, 'rate': t3_rate},
-                    ],
-                }
-                if data_loader.save_bonus_settings(new_settings):
-                    st.success("✅ Настройки бонусов сохранены в Google Sheets")
-                    st.cache_data.clear()
-                    st.rerun()
+                if use_by_category:
+                    st.markdown("**Ставки по категориям дебиторки**")
+                    rates = bonus_settings.get('rates_by_category', {})
+                    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+                    with rc1:
+                        r_0_30 = st.number_input("0-30 дн., %", value=float(rates.get('0-30', 0.0)), step=0.1, format="%.2f", key="r_0_30")
+                    with rc2:
+                        r_31_60 = st.number_input("31-60 дн., %", value=float(rates.get('31-60', 0.0)), step=0.1, format="%.2f", key="r_31_60")
+                    with rc3:
+                        r_61_90 = st.number_input("61-90 дн., %", value=float(rates.get('61-90', 0.0)), step=0.1, format="%.2f", key="r_61_90")
+                    with rc4:
+                        r_91_120 = st.number_input("91-120 дн., %", value=float(rates.get('91-120', 0.0)), step=0.1, format="%.2f", key="r_91_120")
+                    with rc5:
+                        r_120 = st.number_input("120+ дн., %", value=float(rates.get('120+', 0.0)), step=0.1, format="%.2f", key="r_120")
                 else:
-                    st.error("❌ Не удалось сохранить настройки")
+                    r_0_30 = r_31_60 = r_61_90 = r_91_120 = r_120 = 0.0
+
+                if use_by_threshold:
+                    st.markdown("**Пороги оплат и ставки**")
+                    thr = bonus_settings.get('thresholds', [
+                        {'min_amount': 20000, 'rate': 0.0},
+                        {'min_amount': 30000, 'rate': 0.0},
+                        {'min_amount': 50000, 'rate': 0.0},
+                    ])
+                    while len(thr) < 3:
+                        thr.append({'min_amount': 0, 'rate': 0.0})
+
+                    tc1, tc2, tc3 = st.columns(3)
+                    with tc1:
+                        t1_amount = st.number_input("Порог 1, BYN", value=float(thr[0].get('min_amount', 0)), step=1000.0, format="%.0f", key="t1_amount")
+                        t1_rate = st.number_input("Ставка 1, %", value=float(thr[0].get('rate', 0.0)), step=0.1, format="%.2f", key="t1_rate")
+                    with tc2:
+                        t2_amount = st.number_input("Порог 2, BYN", value=float(thr[1].get('min_amount', 0)), step=1000.0, format="%.0f", key="t2_amount")
+                        t2_rate = st.number_input("Ставка 2, %", value=float(thr[1].get('rate', 0.0)), step=0.1, format="%.2f", key="t2_rate")
+                    with tc3:
+                        t3_amount = st.number_input("Порог 3, BYN", value=float(thr[2].get('min_amount', 0)), step=1000.0, format="%.0f", key="t3_amount")
+                        t3_rate = st.number_input("Ставка 3, %", value=float(thr[2].get('rate', 0.0)), step=0.1, format="%.2f", key="t3_rate")
+                else:
+                    t1_amount = t2_amount = t3_amount = 0.0
+                    t1_rate = t2_rate = t3_rate = 0.0
+
+                if st.button("💾 Сохранить настройки бонусов", key="save_bonus_settings_btn"):
+                    new_settings = {
+                        'use_by_category': use_by_category,
+                        'use_by_threshold': use_by_threshold,
+                        'rates_by_category': {
+                            '0-30': r_0_30,
+                            '31-60': r_31_60,
+                            '61-90': r_61_90,
+                            '91-120': r_91_120,
+                            '120+': r_120,
+                        },
+                        'thresholds': [
+                            {'min_amount': t1_amount, 'rate': t1_rate},
+                            {'min_amount': t2_amount, 'rate': t2_rate},
+                            {'min_amount': t3_amount, 'rate': t3_rate},
+                        ],
+                    }
+                    if data_loader.save_bonus_settings(new_settings):
+                        st.success("✅ Настройки бонусов сохранены в Google Sheets")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("❌ Не удалось сохранить настройки")
 
     # ===== TAB7: ПРЕДСЧЕТА =====
     if 'tab7' in tab_map:

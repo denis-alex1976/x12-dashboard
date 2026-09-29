@@ -80,6 +80,7 @@ DEFAULT_ADMIN_SETTINGS = {
     'allow_admins_trust_limits': True,
     'allow_admins_status_days': True,      # ← НОВОЕ: менять сроки статусов
     'allow_admins_inactive_days': True,    # ← НОВОЕ: менять срок ⏰
+    'allow_admins_bonus_settings': True,
 
     # Видимость
     'show_trust_limits': True,
@@ -116,6 +117,7 @@ GSHEETS_LOGIN_HISTORY_WORKSHEET = "LoginHistory"
 GSHEETS_BONUS_WORKSHEET = "BonusSettings"
 GSHEETS_COMPANY_FLAGS_WORKSHEET = "CompanyFlags"
 GSHEETS_TRUST_LIMITS_WORKSHEET = "TrustLimits"
+GSHEETS_REGIONS_WORKSHEET = "Regions"
 
 GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -686,6 +688,91 @@ def load_trust_limits():
     except Exception as e:
         print(f"Ошибка чтения TrustLimits: {e}")
         return dict(DEFAULT_TRUST_LIMITS)
+
+
+def load_regions():
+    """
+    Читает Google Sheets-лист 'Regions'.
+    Возвращает dict {company_code: [list of branches]}.
+
+    Каждое предприятие может иметь несколько филиалов (например, ООО ВетКультура).
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_REGIONS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return {}
+
+        headers = data[0]
+        regions = {}
+        for row in data[1:]:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+
+            code = rec.get('Код \nхоз-ва', '').strip() or rec.get('Код хоз-ва', '').strip()
+            if not code:
+                continue
+
+            primary = rec.get('Основной \nМенеджер', '').strip() or rec.get('Основной Менеджер', '').strip()
+
+            branch = {
+                'code': code,
+                'name': rec.get('Наименование хозяйства', '').strip(),
+                'oblast': rec.get('Область', '').strip(),
+                'raion': rec.get('Район', '').strip(),
+                'primary_manager': primary,
+                'substitute_manager': rec.get('Подмена', '').strip() or None,
+                'latitude': rec.get('Широта', '').strip() or None,
+                'longitude': rec.get('Долгота', '').strip() or None,
+                'address': rec.get('Адрес', '').strip() or None,
+                'office_coords': rec.get('Координаты офиса', '').strip() or None,
+                'distance': rec.get('Расстояние', '').strip() or None,
+            }
+
+            regions.setdefault(code, []).append(branch)
+
+        return regions
+    except Exception as e:
+        print(f"Ошибка чтения Regions: {e}")
+        return {}
+
+
+def load_region_managers():
+    """
+    Читает Google Sheets-лист 'Regions'.
+    Возвращает dict {raion: primary_manager} — закрепление районов за менеджерами.
+    Только строки без кода предприятия.
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_REGIONS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return {}
+
+        headers = data[0]
+        result = {}
+        for row in data[1:]:
+            row = row + [''] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+
+            code = rec.get('Код \nхоз-ва', '').strip() or rec.get('Код хоз-ва', '').strip()
+            if code:
+                continue  # пропускаем строки с кодом
+
+            raion = rec.get('Район', '').strip()
+            if not raion:
+                continue
+
+            primary = rec.get('Основной \nМенеджер', '').strip() or rec.get('Основной Менеджер', '').strip()
+            if not primary:
+                continue
+
+            result[raion] = primary
+
+        return result
+    except Exception as e:
+        print(f"Ошибка чтения RegionManagers: {e}")
+        return {}
 
 
 def save_trust_limits(limits):
@@ -1395,7 +1482,7 @@ def get_debt_companies(df, period_selection=None, manager=None):
         if debt <= 0.5:
             continue
         rows.append({
-            'company_code': code,
+            'company_code': m.get('company_code') or code,
             'company': m.get('company_name') or '',
             'manager': m.get('manager') or '',
             'total_debt': debt,
@@ -1779,7 +1866,7 @@ def get_client_info():
 
 # === РАСЧЁТ СТАТУСОВ И МЕТОК ПРЕДПРИЯТИЙ ===
 
-def get_company_metrics(company_code, df_company, flags, admin_settings, trust_limits, primary_map=None):
+def get_company_metrics(company_code, df_company, flags, admin_settings, trust_limits, primary_map=None, regions_map=None):
     """
     Вычисляет метрики одного предприятия.
 
@@ -1888,8 +1975,25 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     # === АКТИВНЫЙ МЕНЕДЖЕР (для привязки долгов) ===
     active_only = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
     current_manager = result['manager']
+    current_raion = result.get('raion')
 
-    if current_manager and current_manager in active_only:
+    # Приоритет 1: из файла Regions (по совпадению района)
+    file_primary = None
+    if regions_map and company_code in regions_map:
+        branches = regions_map[company_code]
+        # Ищем филиал с совпадающим районом
+        for br in branches:
+            if br.get('raion') == current_raion:
+                file_primary = br.get('primary_manager')
+                break
+        # Если не нашли — берём первый
+        if not file_primary and branches:
+            file_primary = branches[0].get('primary_manager')
+
+    if file_primary:
+        # Основной менеджер — из файла (истина)
+        active_mgr = file_primary
+    elif current_manager and current_manager in active_only:
         # Текущий менеджер активный — долги идут ему
         active_mgr = current_manager
     elif primary_map:
@@ -1899,7 +2003,7 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         if active_mgr not in active_only:
             active_mgr = current_manager
     else:
-        # Нет primary_map — оставляем текущего
+        # Нет данных — оставляем текущего
         active_mgr = current_manager
 
     invoice_dates = sales['invoice_date'].dropna().sort_values()
@@ -1961,6 +2065,19 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         row_manager = r.get('manager')
         if row_manager:
             managers_set.add(row_manager)
+
+    # Добавляем менеджеров из файла Regions — только для ЭТОГО филиала
+    if regions_map and company_code in regions_map:
+        current_raion = result.get('raion')
+        for br in regions_map[company_code]:
+            # Только филиал с совпадающим районом
+            if br.get('raion') == current_raion:
+                pm = br.get('primary_manager')
+                if pm:
+                    managers_set.add(pm)
+                sm = br.get('substitute_manager')
+                if sm:
+                    managers_set.add(sm)
 
     # Словари для пометок (переходящий долг)
     debt_transferred_from = {}
@@ -2249,49 +2366,69 @@ def get_all_companies_summary(df, flags=None, admin_settings=None, trust_limits=
     if df is None or df.empty:
         return {}
 
+    # Загружаем файл закреплений
+    regions_map = load_regions()
+
+    # Заполняем пропущенные районы
+    df = df.copy()
+    df['raion_filled'] = df['raion'].fillna('').astype(str).str.strip()
+
     summary = {}
 
-    # Группируем по company_code
-    grouped = df.groupby('company_code')
+    # Группируем по (company_code, raion)
+    grouped = df.groupby(['company_code', 'raion_filled'])
 
     # Первый проход: базовый summary (для primary_map)
-    for code, df_company in grouped:
+    for (code, raion), df_group in grouped:
         code_str = str(code).strip()
         if not code_str or code_str == 'nan':
             continue
+
+        # Формируем ключ: code|raion или code (если raion пустой)
+        if raion:
+            key = f"{code_str}|{raion}"
+        else:
+            key = code_str
 
         company_flags = flags.get(code_str, {})
 
         metrics = get_company_metrics(
             company_code=code_str,
-            df_company=df_company,
+            df_company=df_group,
             flags=company_flags,
             admin_settings=admin_settings,
             trust_limits=trust_limits,
-            primary_map=None,  # первый проход без primary
+            primary_map=None,
+            regions_map=regions_map,
         )
-        summary[code_str] = metrics
+        summary[key] = metrics
 
-    # Считаем primary_map
+    # Считаем primary_map (эвристика по районам)
     primary_map = get_primary_manager_by_raion(summary)
 
     # Второй проход: пересчёт с учётом primary_map
-    for code, df_company in grouped:
+    for (code, raion), df_group in grouped:
         code_str = str(code).strip()
         if not code_str or code_str == 'nan':
             continue
+
+        if raion:
+            key = f"{code_str}|{raion}"
+        else:
+            key = code_str
 
         company_flags = flags.get(code_str, {})
 
         metrics = get_company_metrics(
             company_code=code_str,
-            df_company=df_company,
+            df_company=df_group,
             flags=company_flags,
             admin_settings=admin_settings,
             trust_limits=trust_limits,
             primary_map=primary_map,
+            regions_map=regions_map,
         )
-        summary[code_str] = metrics
+        summary[key] = metrics
 
     return summary
 
@@ -2402,7 +2539,7 @@ def get_all_court_rows(summary, manager_filter=None):
     for code, m in summary.items():
         # Фильтр по текущему менеджеру предприятия
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if (m.get('active_manager') or m.get('manager')) != manager_filter:
                 continue
 
         court_rows = m.get('court_rows') or []
@@ -2478,7 +2615,7 @@ def get_companies_by_category(summary, manager_filter=None):
     for code, metrics in summary.items():
         # Фильтр по менеджеру
         if manager_filter and manager_filter != 'Все менеджеры':
-            if metrics.get('manager') != manager_filter:
+            if (metrics.get('active_manager') or metrics.get('manager')) != manager_filter:
                 continue
 
         cat = metrics.get('category', 'working')
@@ -2506,7 +2643,7 @@ def get_companies_by_metka(summary, manager_filter=None):
     for code, m in summary.items():
         # Фильтр по менеджеру
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if (m.get('active_manager') or m.get('manager')) != manager_filter:
                 continue
 
         metki = m.get('metki', [])
@@ -2563,7 +2700,7 @@ def get_independent_counts(summary, manager_filter=None):
 
     for code, m in summary.items():
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if (m.get('active_manager') or m.get('manager')) != manager_filter:
                 continue
 
         # Статус — один на предприятие
@@ -2612,13 +2749,13 @@ def get_companies_with_metki_df(summary, manager_filter=None):
     rows = []
     for code, m in summary.items():
         if manager_filter and manager_filter != 'Все менеджеры':
-            if m.get('manager') != manager_filter:
+            if (m.get('active_manager') or m.get('manager')) != manager_filter:
                 continue
 
         metki_raw = m.get('metki', [])
         metki_str = ' • '.join(METKI_LABELS.get(emoji, emoji) for emoji in metki_raw)
         rows.append({
-            'company_code': code,
+            'company_code': m.get('company_code') or code,
             'company_name': m.get('company_name') or '',
             'oblast': m.get('oblast') or '',
             'raion': m.get('raion') or '',

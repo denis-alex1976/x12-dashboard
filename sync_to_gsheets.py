@@ -15,6 +15,8 @@ import openpyxl
 # === НАСТРОЙКИ ===
 EXCEL_PATH = r"C:\ЦЕНТР ИЗЖ\Х\!-Х12.1.xlsm"
 SHEET_NAME = "ИСХОДНЫЕ ДАННЫЕ"
+REGIONS_SHEET_NAME = "Районы"
+REGIONS_WORKSHEET_NAME = "Regions"
 CREDENTIALS_FILE = r"C:\X12\service-account.json"
 SPREADSHEET_ID = "1AWSwJECekzgfvbYlBsBk-Ws78hpNp5TC7VSPdvv0Nso"
 WORKSHEET_NAME = "Data"
@@ -77,6 +79,61 @@ def load_comment_texts():
     wb.close()
     print(f"  Найдено {len(comments)} примечаний")
     return comments
+
+
+def sync_regions(gc):
+    """
+    Синхронизация Excel-листа «Районы» → Google Sheets-лист «Regions».
+    Читает все колонки, какие есть в Excel.
+    Создаёт лист, если его нет.
+    """
+    print()
+    print(f"Чтение Excel-листа '{REGIONS_SHEET_NAME}'...")
+
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name=REGIONS_SHEET_NAME, header=0)
+    except Exception as e:
+        print(f"ОШИБКА чтения листа '{REGIONS_SHEET_NAME}': {e}")
+        return False
+
+    print(f"  Загружено {len(df)} строк, {len(df.columns)} колонок")
+
+    df = df.fillna('')
+
+    print(f"Авторизация в Google (лист '{REGIONS_WORKSHEET_NAME}')...")
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        print(f"ОШИБКА открытия таблицы: {e}")
+        return False
+
+    # Пробуем получить лист; если нет — создаём
+    try:
+        worksheet = sh.worksheet(REGIONS_WORKSHEET_NAME)
+        print(f"  Лист '{REGIONS_WORKSHEET_NAME}' найден")
+    except Exception:
+        print(f"  Лист '{REGIONS_WORKSHEET_NAME}' не найден — создаю...")
+        try:
+            worksheet = sh.add_worksheet(
+                title=REGIONS_WORKSHEET_NAME,
+                rows=len(df) + 10,
+                cols=len(df.columns) + 2
+            )
+        except Exception as e:
+            print(f"ОШИБКА создания листа: {e}")
+            return False
+
+    print(f"Отправка в Google Sheets (лист '{REGIONS_WORKSHEET_NAME}')...")
+    try:
+        worksheet.clear()
+        data_to_write = [df.columns.tolist()] + df.astype(str).values.tolist()
+        worksheet.update(data_to_write, value_input_option='RAW')
+    except Exception as e:
+        print(f"ОШИБКА записи: {e}")
+        return False
+
+    print(f"ГОТОВО! Записано {len(df)} строк, {len(df.columns)} колонок.")
+    return True
 
 
 def main():
@@ -149,6 +206,13 @@ def main():
         sys.exit(1)
 
     print(f"ГОТОВО! Записано {len(df)} строк, {len(df.columns)} колонок.")
+
+    # === СИНХРОНИЗАЦИЯ ЛИСТА «РАЙОНЫ» ===
+    print()
+    print("=" * 70)
+    print("СИНХРОНИЗАЦИЯ ЛИСТА «РАЙОНЫ»")
+    print("=" * 70)
+    sync_regions(gc)
 
 
 if __name__ == "__main__":
