@@ -81,6 +81,7 @@ DEFAULT_ADMIN_SETTINGS = {
     'allow_admins_status_days': True,      # ← НОВОЕ: менять сроки статусов
     'allow_admins_inactive_days': True,    # ← НОВОЕ: менять срок ⏰
     'allow_admins_bonus_settings': True,
+    'allow_admins_plans_edit': True,
 
     # Видимость
     'show_trust_limits': True,
@@ -108,6 +109,30 @@ DEFAULT_TRUST_LIMITS = {
     'threshold_3': 10000.0,
 }
 
+# === ПЛАНЫ ===
+
+PLAN_CATEGORIES = [
+    # (key, label, unit)
+    ('sales',          '💰 Продажи',          'BYN'),
+    ('payments',       '💵 Оплаты',           'BYN'),
+    ('new_companies',  '🆕 Новые предприятия', 'шт.'),
+    ('pcr',            '🔬 ПЦР',              'BYN'),
+    ('ifa',            '🔬 ИФА',              'BYN'),
+    ('biochem',        '🔬 Биохимия',         'BYN'),
+    ('microbio',       '🔬 Микробиология',    'BYN'),
+    ('pcr_mastitis',   '🔬 ПЦР маститы',      'BYN'),
+    ('oak',            '🔬 ОАК',              'BYN'),
+    ('urine',          '🔬 Моча',             'BYN'),
+    ('avg_check',      '📈 Средний чек',      'BYN'),
+    ('companies_count','🏢 Отработано хозяйств', 'шт.'),
+]
+
+DEFAULT_PLANS_SETTINGS = {
+    'allow_admins_plans_edit': True,
+    'enabled_plans': [key for key, _, _ in PLAN_CATEGORIES],
+    'plans': {key: 0.0 for key, _, _ in PLAN_CATEGORIES},
+}
+
 # === GOOGLE SHEETS ===
 GSHEETS_CREDENTIALS = "service-account.json"
 GSHEETS_SPREADSHEET_ID = "1AWSwJECekzgfvbYlBsBk-Ws78hpNp5TC7VSPdvv0Nso"
@@ -118,6 +143,7 @@ GSHEETS_BONUS_WORKSHEET = "BonusSettings"
 GSHEETS_COMPANY_FLAGS_WORKSHEET = "CompanyFlags"
 GSHEETS_TRUST_LIMITS_WORKSHEET = "TrustLimits"
 GSHEETS_REGIONS_WORKSHEET = "Regions"
+GSHEETS_PLANS_WORKSHEET = "Plans"
 
 GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -715,6 +741,35 @@ def load_regions():
 
             primary = rec.get('Основной \nМенеджер', '').strip() or rec.get('Основной Менеджер', '').strip()
 
+            # Парсим JSONL из колонки «Адрес»
+            address_raw = rec.get('Адрес', '').strip()
+            enterprise_json = parse_enterprise_json(address_raw)
+
+            # Извлекаем координаты из JSONL или из колонок
+            admin = enterprise_json.get('administration', {}) or {}
+            lat = admin.get('latitude') or rec.get('Широта', '').strip() or None
+            lon = admin.get('longitude') or rec.get('Долгота', '').strip() or None
+            distance_val = admin.get('distance_from_start_km') or rec.get('Расстояние', '').strip() or None
+
+            # Животные
+            livestock_summary = enterprise_json.get('livestock_summary', {}) or {}
+            animal_type = rec.get('Вид животных', '').strip() or None
+            livestock_raw = rec.get('Поголовье', '').strip() or None
+
+            # Площадки
+            production_sites = enterprise_json.get('production_sites', []) or []
+            production_sites_count = enterprise_json.get('production_sites_count', 0) or 0
+
+            # Контакты
+            contacts = enterprise_json.get('contacts', {}) or {}
+
+            # Финансовая стабильность
+            stability_raw = rec.get('Статус', '').strip()
+            try:
+                stability = int(float(stability_raw)) if stability_raw else None
+            except (ValueError, TypeError):
+                stability = None
+
             branch = {
                 'code': code,
                 'name': rec.get('Наименование хозяйства', '').strip(),
@@ -722,11 +777,27 @@ def load_regions():
                 'raion': rec.get('Район', '').strip(),
                 'primary_manager': primary,
                 'substitute_manager': rec.get('Подмена', '').strip() or None,
-                'latitude': rec.get('Широта', '').strip() or None,
-                'longitude': rec.get('Долгота', '').strip() or None,
-                'address': rec.get('Адрес', '').strip() or None,
+                'latitude': lat,
+                'longitude': lon,
+                'address': address_raw or None,
                 'office_coords': rec.get('Координаты офиса', '').strip() or None,
-                'distance': rec.get('Расстояние', '').strip() or None,
+                'distance': distance_val,
+                # Животные
+                'animal_type': animal_type,
+                'livestock_raw': livestock_raw,
+                'total_animals': livestock_summary.get('total_animals', 0),
+                'milking_cows': livestock_summary.get('milking_cows', 0),
+                'pigs_count': livestock_summary.get('pigs_count', 0),
+                'poultry': livestock_summary.get('poultry', {}),
+                # Площадки
+                'production_sites_count': production_sites_count,
+                'production_sites': production_sites,
+                # Контакты
+                'contacts': contacts,
+                # Финансы
+                'stability': stability,
+                # Полный JSONL (для карточки)
+                'enterprise_json': enterprise_json,
             }
 
             regions.setdefault(code, []).append(branch)
@@ -735,6 +806,29 @@ def load_regions():
     except Exception as e:
         print(f"Ошибка чтения Regions: {e}")
         return {}
+
+
+def parse_enterprise_json(json_str):
+    """
+    Парсит JSONL-строку из колонки «Адрес».
+    Возвращает dict или пустой dict при ошибке.
+    """
+    if not json_str or not isinstance(json_str, str):
+        return {}
+
+    s = json_str.strip()
+    if not s or s.lower() in ('nan', 'none', 'null'):
+        return {}
+
+    try:
+        data = json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
 
 
 def load_region_managers():
@@ -773,6 +867,221 @@ def load_region_managers():
     except Exception as e:
         print(f"Ошибка чтения RegionManagers: {e}")
         return {}
+
+
+def get_plans_settings():
+    """
+    Читает настройки планов из Google Sheets-листа 'Plans'.
+    Возвращает dict.
+    """
+    try:
+        worksheet = _get_worksheet(GSHEETS_PLANS_WORKSHEET)
+        data = worksheet.get_all_values()
+        if not data or len(data) < 2:
+            return dict(DEFAULT_PLANS_SETTINGS)
+
+        for row in data[1:]:
+            if len(row) >= 2 and row[0].strip() == 'plans':
+                try:
+                    settings = json.loads(row[1])
+                    result = dict(DEFAULT_PLANS_SETTINGS)
+                    result.update(settings)
+                    # Мержим plans отдельно
+                    if 'plans' in settings:
+                        merged_plans = dict(DEFAULT_PLANS_SETTINGS['plans'])
+                        merged_plans.update(settings['plans'])
+                        result['plans'] = merged_plans
+                    return result
+                except json.JSONDecodeError:
+                    print("Не удалось распарсить plans")
+                    return dict(DEFAULT_PLANS_SETTINGS)
+
+        return dict(DEFAULT_PLANS_SETTINGS)
+    except Exception as e:
+        print(f"Ошибка чтения Plans: {e}")
+        return dict(DEFAULT_PLANS_SETTINGS)
+
+
+def save_plans_settings(settings):
+    """
+    Сохраняет настройки планов в Google Sheets-лист 'Plans'.
+    Создаёт лист, если его нет.
+    """
+    try:
+        # Проверяем наличие листа, создаём если нет
+        try:
+            worksheet = _get_worksheet(GSHEETS_PLANS_WORKSHEET)
+        except Exception:
+            sh = _get_spreadsheet()
+            worksheet = sh.add_worksheet(
+                title=GSHEETS_PLANS_WORKSHEET,
+                rows=10,
+                cols=2
+            )
+            worksheet.append_row(['key', 'value'])
+            # Сбрасываем кэш
+            global _worksheets_cache
+            _worksheets_cache[GSHEETS_PLANS_WORKSHEET] = worksheet
+
+        data = worksheet.get_all_values()
+        if not data:
+            worksheet.append_row(['key', 'value'])
+
+        json_str = json.dumps(settings, ensure_ascii=False)
+
+        found_row = None
+        for i, row in enumerate(data):
+            if len(row) >= 1 and row[0].strip() == 'plans':
+                found_row = i + 1
+                break
+
+        if found_row:
+            worksheet.update(f'B{found_row}', [[json_str]], value_input_option='RAW')
+        else:
+            worksheet.append_row(['plans', json_str], value_input_option='RAW')
+
+        return True
+    except Exception as e:
+        print(f"Ошибка сохранения Plans: {e}")
+        return False
+
+
+def calculate_plan_fact(df, summary, manager_filter=None, month_year=None):
+    """
+    Считает факт по всем категориям планов за указанный месяц.
+
+    df — полный DataFrame (для продаж, оплат, исследований)
+    summary — summary (для новых предприятий)
+    manager_filter — менеджер (из сайдбара)
+    month_year — (год, месяц). Если None — текущий.
+
+    Возвращает dict: {key: value, ...}
+    """
+    if df is None or df.empty:
+        return {key: 0.0 for key, _, _ in PLAN_CATEGORIES}
+
+    today = datetime.now()
+    if month_year:
+        year, month = month_year
+    else:
+        year, month = today.year, today.month
+
+    # Фильтр по месяцу
+    df_month = df.copy()
+    df_month['_year'] = df_month['invoice_date'].dt.year
+    df_month['_month'] = df_month['invoice_date'].dt.month
+
+    # Фильтр по менеджеру (для продаж — по manager заявки)
+    def _filter_mgr(data, mgr_col='manager'):
+        if manager_filter and manager_filter != 'Все менеджеры':
+            return data[data[mgr_col] == manager_filter]
+        return data
+
+    # === ПРОДАЖИ ===
+    sales = df_month[
+        (df_month['row_type'] == 'sale') &
+        (df_month['order_type'] == 0) &
+        (df_month['_year'] == year) &
+        (df_month['_month'] == month)
+    ]
+    sales = _filter_mgr(sales)
+    sales_sum = float(sales['invoice_amount'].sum())
+
+    # === ОПЛАТЫ ===
+    payments = df_month[
+        (df_month['row_type'] == 'payment') &
+        (df_month['payment_date'].dt.year == year) &
+        (df_month['payment_date'].dt.month == month)
+    ]
+    payments = _filter_mgr(payments)
+    payments_sum = float(payments['payment_amount'].sum())
+
+    # === НОВЫЕ ПРЕДПРИЯТИЯ ===
+    # Первый счёт за всё время — в текущем месяце
+    new_companies = 0
+    for code, m in summary.items():
+        first_date = m.get('first_invoice_date')
+        if first_date is None:
+            continue
+        if hasattr(first_date, 'year'):
+            if first_date.year == year and first_date.month == month:
+                if manager_filter and manager_filter != 'Все менеджеры':
+                    if m.get('manager') != manager_filter:
+                        continue
+                new_companies += 1
+
+    # === ПО ВИДАМ ИССЛЕДОВАНИЙ ===
+    def _research_sum(research_key):
+        research_map = {
+            'pcr': 'ПЦР',
+            'ifa': 'ИФА',
+            'biochem': 'Биохимия',
+            'microbio': 'Микробиология',
+            'pcr_mastitis': 'ПЦР маститы',
+            'oak': 'ОАК',
+            'urine': 'Моча',
+        }
+        target = research_map.get(research_key)
+        if not target:
+            return 0.0
+        r = sales[sales['research_type'] == target]
+        return float(r['invoice_amount'].sum())
+
+    # === СРЕДНИЙ ЧЕК ===
+    unique_invoices = sales[['company', 'invoice_num', 'invoice_date']].drop_duplicates()
+    invoices_count = len(unique_invoices)
+    avg_check = sales_sum / invoices_count if invoices_count > 0 else 0.0
+
+    # === ОТРАБОТАННЫХ ХОЗЯЙСТВ ===
+    companies_count = int(sales['company_code'].nunique()) if not sales.empty else 0
+
+    return {
+        'sales': sales_sum,
+        'payments': payments_sum,
+        'new_companies': new_companies,
+        'pcr': _research_sum('pcr'),
+        'ifa': _research_sum('ifa'),
+        'biochem': _research_sum('biochem'),
+        'microbio': _research_sum('microbio'),
+        'pcr_mastitis': _research_sum('pcr_mastitis'),
+        'oak': _research_sum('oak'),
+        'urine': _research_sum('urine'),
+        'avg_check': avg_check,
+        'companies_count': companies_count,
+    }
+
+
+def get_plan_summary(df, summary, month_year=None):
+    """
+    Считает факт по всем менеджерам за указанный месяц.
+
+    Возвращает DataFrame:
+    Менеджер | sales | payments | new_companies | ... | avg_check | companies_count
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Список активных менеджеров
+    active_managers = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
+
+    rows = []
+    for mgr in active_managers:
+        fact = calculate_plan_fact(df, summary, manager_filter=mgr, month_year=month_year)
+        fact['manager'] = mgr
+        rows.append(fact)
+
+    # Итоговая строка «Все менеджеры»
+    total = calculate_plan_fact(df, summary, manager_filter='Все менеджеры', month_year=month_year)
+    total['manager'] = 'Все менеджеры'
+    rows.append(total)
+
+    df_res = pd.DataFrame(rows)
+
+    # Переставляем manager в начало
+    cols = ['manager'] + [c for c in df_res.columns if c != 'manager']
+    df_res = df_res[cols]
+
+    return df_res
 
 
 def save_trust_limits(limits):
@@ -1927,6 +2236,14 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
         'court_transferred_from': {},
         'overpay_transferred_from': {},
         'managers_set': set(),
+        # Для покрытия
+        'stability': None,
+        'total_animals': 0,
+        'milking_cows': 0,
+        'pigs_count': 0,
+        'poultry': {},
+        'production_sites_count': 0,
+        'coverage_group': 'other',
     }
 
     # Если нет счетов — «Пассивное» (или ручное «Потенциальное»)
@@ -1971,6 +2288,26 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     else:
         result['manager'] = first_row.get('manager')
         result['last_activity_date'] = None
+
+    # === ДАННЫЕ ИЗ REGIONS (для покрытия) ===
+    if regions_map and company_code in regions_map:
+        branches = regions_map[company_code]
+        # Ищем филиал с совпадающим районом
+        target_branch = None
+        for br in branches:
+            if br.get('raion') == result.get('raion'):
+                target_branch = br
+                break
+        if not target_branch and branches:
+            target_branch = branches[0]
+
+        if target_branch:
+            result['stability'] = target_branch.get('stability')
+            result['total_animals'] = target_branch.get('total_animals', 0) or 0
+            result['milking_cows'] = target_branch.get('milking_cows', 0) or 0
+            result['pigs_count'] = target_branch.get('pigs_count', 0) or 0
+            result['poultry'] = target_branch.get('poultry', {}) or {}
+            result['production_sites_count'] = target_branch.get('production_sites_count', 0) or 0
 
     # === АКТИВНЫЙ МЕНЕДЖЕР (для привязки долгов) ===
     active_only = [m for m in ACTIVE_MANAGERS if m != 'Все менеджеры']
@@ -2212,6 +2549,9 @@ def get_company_metrics(company_code, df_company, flags, admin_settings, trust_l
     # === КАТЕГОРИЯ (для круговой) ===
     result['category'] = get_priority_category(result, flags)
 
+    # === ГРУППА ПОКРЫТИЯ ===
+    result['coverage_group'] = calculate_coverage_group(result)
+
     return result
 
 
@@ -2310,6 +2650,61 @@ def calculate_company_metki(result, flags, admin_settings, trust_limits):
             metki.append('⏰')
 
     return metki
+
+
+def calculate_coverage_group(result):
+    """
+    Определяет группу предприятия для расчёта покрытия.
+
+    Приоритет: Другие → Нерабочие → Рабочие.
+
+    Другие: 💸 Должник, 💀 ЧС, стабильность 3, не КРС
+    Нерабочие: 🗑️ Потери, ⏰ Нет заявок, 💰 Дебиторка
+    Рабочие: ✅ Актив, 😴 Пассив, 🆕 Новые, 🔄 Камбэки
+    """
+    metki = result.get('metki', [])
+    status = result.get('status', 'working')
+
+    # === ДРУГИЕ (приоритет 1) ===
+    # 💀 ЧС
+    if '💀' in metki:
+        return 'other'
+
+    # 💸 Должник
+    if '💸' in metki:
+        return 'other'
+
+    # Стабильность 3
+    stability = result.get('stability')
+    if stability == 3:
+        return 'other'
+
+    # Не КРС (свиньи или птица, но не КРС)
+    pigs = result.get('pigs_count', 0) or 0
+    poultry = result.get('poultry', {}) or {}
+    has_poultry = bool(poultry.get('type'))
+    total_animals = result.get('total_animals', 0) or 0
+    milking_cows = result.get('milking_cows', 0) or 0
+
+    if (pigs > 0 or has_poultry) and total_animals == 0 and milking_cows == 0:
+        return 'other'
+
+    # === НЕРАБОЧИЕ (приоритет 2) ===
+    if '💰' in metki:
+        return 'non_working'
+
+    if '⏰' in metki:
+        return 'non_working'
+
+    if status == 'lost':
+        return 'non_working'
+
+    # === РАБОЧИЕ (приоритет 3) ===
+    if status in ('working', 'passive', 'new', 'returned'):
+        return 'working'
+
+    # По умолчанию — другие
+    return 'other'
 
 
 def get_priority_category(result, flags):

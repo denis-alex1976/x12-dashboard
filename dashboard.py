@@ -63,6 +63,7 @@ STATUS_COLORS = {
 }
 
 USER_TABS = [
+    ('tab0', "📋 План"),
     ('tab1', "🏢 Предприятия"),
     ('tab2', "📍 Районы"),
     ('tab3', "🗺️ Области"),
@@ -476,6 +477,61 @@ def render_access_tab():
         st.error(f"Ошибка чтения журнала: {e}")
 
 
+    # === НАСТРОЙКА ПЛАНОВ (админ + суперадмин) ===
+    admin_settings_plans = data_loader.get_admin_settings()
+    can_edit_plans = (
+        st.session_state.role == 'super_admin' or
+        (st.session_state.role == 'admin' and admin_settings_plans.get('allow_admins_plans_edit', True))
+    )
+
+    if can_edit_plans:
+        st.divider()
+
+        with st.expander("📋 Настройка планов", expanded=False):
+            st.caption("Установите планы продаж. Пустое или 0 — план не задан.")
+
+            plans_settings = data_loader.get_plans_settings()
+            plans = plans_settings.get('plans', {})
+            enabled_plans = plans_settings.get('enabled_plans', [])
+
+            new_plans = {}
+            new_enabled = []
+
+            for key, label, unit in data_loader.PLAN_CATEGORIES:
+                col_chk, col_val = st.columns([1, 3])
+                with col_chk:
+                    enabled = st.checkbox(
+                        label,
+                        value=(key in enabled_plans),
+                        key=f"access_plan_chk_{key}"
+                    )
+                with col_val:
+                    val = st.number_input(
+                        f"{unit}",
+                        value=float(plans.get(key, 0.0)),
+                        min_value=0.0,
+                        step=1000.0 if unit == 'BYN' else 1.0,
+                        format="%.2f" if unit == 'BYN' else "%.0f",
+                        key=f"access_plan_val_{key}",
+                        label_visibility="collapsed"
+                    )
+                if enabled:
+                    new_enabled.append(key)
+                    new_plans[key] = val
+
+            if st.button("💾 Сохранить планы", key="access_save_plans_btn", type="primary"):
+                new_settings = dict(plans_settings)
+                new_settings['plans'] = new_plans
+                new_settings['enabled_plans'] = new_enabled
+
+                if data_loader.save_plans_settings(new_settings):
+                    st.success("✅ Планы сохранены")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("❌ Не удалось сохранить планы")
+
+
     # === РАЗРЕШЕНИЯ ДЛЯ АДМИНОВ (только суперадмин) ===
     if st.session_state.role == 'super_admin':
         st.divider()
@@ -532,6 +588,7 @@ def render_access_tab():
 
             st.divider()
 
+
             # Прочие настройки
             st.markdown("**⚙️ Прочие настройки**")
             new_allow_bonus = st.checkbox(
@@ -539,8 +596,11 @@ def render_access_tab():
                 value=admin_settings.get('allow_admins_bonus_settings', True),
                 key="res_allow_bonus"
             )
-
-            st.divider()
+            new_allow_plans = st.checkbox(
+                "📋 Настройка планов — админы могут менять",
+                value=admin_settings.get('allow_admins_plans_edit', True),
+                key="res_allow_plans"
+            )
 
             # Видимость
             st.markdown("**👁️ Видимость**")
@@ -559,6 +619,7 @@ def render_access_tab():
                 new_settings['allow_admins_inactive_days'] = new_allow_inactive
                 new_settings['allow_admins_potential_days'] = new_allow_potential
                 new_settings['allow_admins_bonus_settings'] = new_allow_bonus
+                new_settings['allow_admins_plans_edit'] = new_allow_plans
                 new_settings['show_trust_limits'] = new_show_trust
 
                 if data_loader.save_admin_settings(new_settings):
@@ -812,6 +873,265 @@ def render_metki_editor(summary, selected_manager, can_edit_blacklist, can_edit_
             st.rerun()
         else:
             st.error("❌ Не удалось сохранить метку")
+
+
+def render_plan_tab(df, summary, selected_periods, selected_manager, user_role):
+    """Вкладка «📋 План»."""
+
+    # === ОПРЕДЕЛЯЕМ МЕСЯЦ ===
+    MONTHS_RU_REVERSE = {
+        'январь': 1, 'февраль': 2, 'март': 3, 'апрель': 4,
+        'май': 5, 'июнь': 6, 'июль': 7, 'август': 8,
+        'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12,
+    }
+
+    month_year = None
+    if selected_periods and 'Весь период' not in selected_periods:
+        # Ищем месяц (например, '2026 сентябрь')
+        for p in selected_periods:
+            if ' ' in p and p.startswith('2026 '):
+                month_ru = p.replace('2026 ', '').strip()
+                m = MONTHS_RU_REVERSE.get(month_ru)
+                if m:
+                    month_year = (2026, m)
+                    break
+
+        # Если выбран только год ('2026') — берём последний месяц с данными
+        if month_year is None:
+            only_year = any(p.isdigit() and len(p) == 4 for p in selected_periods)
+            if only_year:
+                sales_all = df[(df['row_type'] == 'sale') & (df['order_type'] == 0)]
+                if not sales_all.empty:
+                    last_date = sales_all['invoice_date'].max()
+                    if last_date is not None and hasattr(last_date, 'year'):
+                        month_year = (last_date.year, last_date.month)
+
+    # Если период не выбран / «Весь период» → текущий месяц
+    if month_year is None:
+        now = datetime.now()
+        month_year = (now.year, now.month)
+
+    year, month = month_year
+    month_label = f"{MONTHS_RU[month]} {year}"
+
+    st.subheader("📋 План продаж")
+    st.caption(f"Период: **{month_label}**")
+
+    # === НАСТРОЙКИ ПЛАНОВ ===
+    plans_settings = data_loader.get_plans_settings()
+    plans = plans_settings.get('plans', {})
+    enabled_plans = plans_settings.get('enabled_plans', [])
+
+    # === ФАКТ ===
+    plan_summary = data_loader.get_plan_summary(df, summary, month_year=month_year)
+
+    if plan_summary.empty:
+        st.info("Нет данных за выбранный период")
+        return
+
+    # Фильтр по менеджеру
+    if selected_manager != 'Все менеджеры':
+        plan_summary = plan_summary[plan_summary['manager'] == selected_manager]
+        if plan_summary.empty:
+            st.info(f"Нет данных для менеджера {selected_manager}")
+            return
+
+    # === KPI ПО ПРОДАЖАМ ===
+    # Если выбран конкретный — берём его. Иначе — строку «Все менеджеры».
+    if selected_manager == 'Все менеджеры':
+        total_row = plan_summary[plan_summary['manager'] == 'Все менеджеры']
+    else:
+        total_row = plan_summary  # только одна строка
+
+    # Количество менеджеров для общего плана
+    if selected_manager == 'Все менеджеры':
+        n_managers = len([m for m in data_loader.ACTIVE_MANAGERS if m != 'Все менеджеры'])
+    else:
+        n_managers = 1
+
+    # === ПЛАН / ФАКТ ПО ПРОДАЖАМ ===
+    plan_sales = plans.get('sales', 0.0) * n_managers
+    fact_sales = float(total_row['sales'].iloc[0]) if not total_row.empty else 0.0
+
+    if plan_sales > 0:
+        percent_sales = fact_sales / plan_sales * 100
+        remainder_sales = plan_sales - fact_sales
+    else:
+        percent_sales = None
+        remainder_sales = 0.0
+
+    # === ПЛАН / ФАКТ ПО ОПЛАТАМ ===
+    plan_payments = plans.get('payments', 0.0) * n_managers
+    fact_payments = float(total_row['payments'].iloc[0]) if not total_row.empty else 0.0
+
+    if plan_payments > 0:
+        percent_payments = fact_payments / plan_payments * 100
+        remainder_payments = plan_payments - fact_payments
+    else:
+        percent_payments = None
+        remainder_payments = 0.0
+
+    # === KPI ПРОДАЖИ ===
+    st.markdown("**💰 Продажи**")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(f'<div class="metric-box"><h3>💰 План</h3><p>{format_int(plan_sales)}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+    with k2:
+        st.markdown(f'<div class="metric-box"><h3>💵 Факт</h3><p>{format_int(fact_sales)}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+    with k3:
+        if percent_sales is None:
+            st.markdown(f'<div class="metric-box"><h3>📊 Выполнение</h3><p>—</p></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="metric-box"><h3>📊 Выполнение</h3><p>{percent_sales:.1f}%</p></div>', unsafe_allow_html=True)
+    with k4:
+        st.markdown(f'<div class="metric-box"><h3>📉 Остаток</h3><p>{format_int(max(0, remainder_sales))}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+
+    # === KPI ОПЛАТЫ ===
+    st.markdown("**💵 Оплаты**")
+    kk1, kk2, kk3, kk4 = st.columns(4)
+    with kk1:
+        st.markdown(f'<div class="metric-box"><h3>💰 План</h3><p>{format_int(plan_payments)}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+    with kk2:
+        st.markdown(f'<div class="metric-box"><h3>💵 Факт</h3><p>{format_int(fact_payments)}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+    with kk3:
+        if percent_payments is None:
+            st.markdown(f'<div class="metric-box"><h3>📊 Выполнение</h3><p>—</p></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="metric-box"><h3>📊 Выполнение</h3><p>{percent_payments:.1f}%</p></div>', unsafe_allow_html=True)
+    with kk4:
+        st.markdown(f'<div class="metric-box"><h3>📉 Остаток</h3><p>{format_int(max(0, remainder_payments))}</p><h3>BYN</h3></div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # === ТРИ ТАБЛИЦЫ: ФАКТ / ПЛАН / % ===
+    st.subheader("📋 План по менеджерам")
+
+    # Собираем данные: {manager: {key: fact}}
+    managers_list = plan_summary['manager'].tolist()
+
+    # Категории (только включённые)
+    active_cats = [(k, l, u) for k, l, u in data_loader.PLAN_CATEGORIES if k in enabled_plans]
+
+    # ФАКТ
+    fact_data = {'Категория': [label for _, label, _ in active_cats]}
+    for mgr in managers_list:
+        mgr_row = plan_summary[plan_summary['manager'] == mgr]
+        if mgr_row.empty:
+            continue
+        r = mgr_row.iloc[0]
+        fact_data[mgr] = [format_int(r.get(key, 0)) for key, _, _ in active_cats]
+    df_fact = pd.DataFrame(fact_data)
+
+    # ПЛАН
+    plan_data = {'Категория': [label for _, label, _ in active_cats]}
+    for mgr in managers_list:
+        plan_data[mgr] = [format_int(plans.get(key, 0)) for key, _, _ in active_cats]
+    df_plan = pd.DataFrame(plan_data)
+
+    # %
+    pct_data = {'Категория': [label for _, label, _ in active_cats]}
+    for mgr in managers_list:
+        mgr_row = plan_summary[plan_summary['manager'] == mgr]
+        if mgr_row.empty:
+            continue
+        r = mgr_row.iloc[0]
+        pcts = []
+        for key, _, _ in active_cats:
+            fact = float(r.get(key, 0))
+            plan = float(plans.get(key, 0))
+            if plan > 0:
+                pcts.append(f"{fact / plan * 100:.0f}%")
+            else:
+                pcts.append("—")
+        pct_data[mgr] = pcts
+    df_pct = pd.DataFrame(pct_data)
+
+    # Отображение — три таблицы
+    st.markdown("**Факт**")
+    st.dataframe(df_fact, use_container_width=True, hide_index=True)
+
+    st.markdown("**План**")
+    st.dataframe(df_plan, use_container_width=True, hide_index=True)
+
+    st.markdown("**% выполнения**")
+    st.dataframe(df_pct, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # === ПРОГРЕСС-БАРЫ ПО КАТЕГОРИЯМ ===
+    st.subheader("📊 Выполнение по категориям")
+
+    if total_row.empty:
+        st.info("Нет данных")
+    else:
+        t = total_row.iloc[0]
+        for key, label, unit in data_loader.PLAN_CATEGORIES:
+            if key not in enabled_plans:
+                continue
+            fact = float(t.get(key, 0))
+            plan = float(plans.get(key, 0))
+            if plan <= 0:
+                continue
+            pct = fact / plan * 100
+            if pct >= 100:
+                color = "🟢"
+            elif pct >= 50:
+                color = "🟡"
+            else:
+                color = "🔴"
+            st.markdown(f"**{color} {label}** — {format_int(fact)} / {format_int(plan)} ({pct:.0f}%)")
+            st.progress(min(pct / 100, 1.0))
+
+    st.divider()
+
+    # === ДИАГРАММЫ ===
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**План vs Факт по категориям**")
+        chart_data = []
+        if not total_row.empty:
+            t = total_row.iloc[0]
+            for key, label, unit in data_loader.PLAN_CATEGORIES:
+                if key not in enabled_plans:
+                    continue
+                plan = float(plans.get(key, 0))
+                fact = float(t.get(key, 0))
+                if plan <= 0 and fact <= 0:
+                    continue
+                chart_data.append({'Категория': label, 'План': plan, 'Факт': fact})
+
+        if chart_data:
+            df_chart = pd.DataFrame(chart_data)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=df_chart['Категория'], y=df_chart['План'], name='План', marker_color='#A7C7E7'))
+            fig.add_trace(go.Bar(x=df_chart['Категория'], y=df_chart['Факт'], name='Факт', marker_color='#E27D60'))
+            fig.update_layout(
+                barmode='group',
+                xaxis_tickangle=-45,
+                yaxis=dict(automargin=True, tickformat=',.0f'),
+                margin=dict(l=20, r=20, b=100),
+            )
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+    with col2:
+        st.markdown("**Факт по менеджерам (продажи)**")
+        mgr_data = plan_summary[plan_summary['manager'] != 'Все менеджеры'].copy()
+        if not mgr_data.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=mgr_data['manager'], y=mgr_data['sales'], name='Факт', marker_color='#41B3A3'))
+            if plan_sales > 0:
+                fig.add_hline(
+                    y=plan_sales, line_dash="dash", line_color="#E27D60",
+                    annotation_text=f"План: {format_int(plan_sales)}", annotation_position="top right"
+                )
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                yaxis=dict(automargin=True, tickformat=',.0f'),
+                margin=dict(l=20, r=20, b=100),
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
 
 def render_admin_settings(summary, selected_manager):
@@ -1323,10 +1643,20 @@ def main():
 
     # ===== ТАБЫ =====
     user_tabs = st.session_state.allowed_tabs
+
+    # Проверяем — включены ли планы
+    plans_settings_check = data_loader.get_plans_settings()
+    plans_enabled = bool(plans_settings_check.get('enabled_plans', []))
+
+    # Фильтруем USER_TABS — убираем tab0, если планы отключены
+    base_tabs = USER_TABS
+    if not plans_enabled:
+        base_tabs = [(k, v) for k, v in USER_TABS if k != 'tab0']
+
     if 'all' in user_tabs:
-        visible_user_tabs = USER_TABS
+        visible_user_tabs = base_tabs
     else:
-        visible_user_tabs = [(k, v) for k, v in USER_TABS if k in user_tabs]
+        visible_user_tabs = [(k, v) for k, v in base_tabs if k in user_tabs]
 
     if user_role == 'super_admin':
         visible_tabs = list(visible_user_tabs) + list(ADMIN_TABS)
@@ -1338,7 +1668,21 @@ def main():
         return
 
     tab_objects = st.tabs([v for _, v in visible_tabs])
+    # Summary — один раз для всех вкладок
+    admin_settings = data_loader.get_admin_settings()
+    trust_limits = data_loader.load_trust_limits()
+    summary = data_loader.get_summary_cached(
+        df,
+        admin_settings=admin_settings,
+        trust_limits=trust_limits,
+    )
     tab_map = {k: tab_objects[i] for i, (k, _) in enumerate(visible_tabs)}
+    
+    # ===== TAB0: ПЛАН =====
+    if 'tab0' in tab_map:
+        with tab_map['tab0']:
+            render_plan_tab(df, summary, selected_periods, selected_manager, user_role)
+
     # ===== TAB1: ПРЕДПРИЯТИЯ =====
     if 'tab1' in tab_map:
         with tab_map['tab1']:
@@ -1387,17 +1731,6 @@ def main():
             # СЕКЦИЯ 2: КАТЕГОРИИ ПРЕДПРИЯТИЙ (новое)
             # ============================================================
             st.subheader("🏷️ Категории предприятий")
-
-            # Загружаем настройки и флаги
-            admin_settings = data_loader.get_admin_settings()
-            trust_limits = data_loader.load_trust_limits()
-
-            # Summary с кэшем
-            summary = data_loader.get_summary_cached(
-                df, 
-                admin_settings=admin_settings,
-                trust_limits=trust_limits
-            )
 
             # Считаем оба представления:
             # cat_counts — Способ 1 (приоритет, для круговой и списков)

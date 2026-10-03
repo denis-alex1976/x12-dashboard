@@ -37,3 +37,7 @@ Thumbs.db
 python
 
 sync_log.txt
+enterprises_raw.jsonl 
+mshp_page.html 
+*.jsonl 
+*.html 
